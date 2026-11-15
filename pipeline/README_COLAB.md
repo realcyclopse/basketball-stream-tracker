@@ -39,6 +39,14 @@ Keep the API key out of notebooks and commits: store it as a Colab secret named
    `"draft": true` line.
 7. `cd web && npm run dev`, pick a clip and check the overlay.
 
+## 8. Run 100% Free Live GPU API Server (for web app video uploads)
+
+To connect your deployed or local web app to Google Colab's free GPU without manual zip downloads:
+1. Run Section 8 in the Colab notebook: `!python colab_server.py`.
+2. Cloudflare Tunnel automatically starts and prints a free HTTPS endpoint:
+   `https://<random-id>.trycloudflare.com`
+3. Open your CourtView Live web dashboard, click **"Upload Clip"**, paste that URL, and upload any `.mp4` video. Colab's GPU will analyze it on-the-fly and stream live radar telemetry directly back to your browser!
+
 ## Trackers
 
 | `--tracker` | Needs | Outlines | Ids |
