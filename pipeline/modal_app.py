@@ -164,7 +164,7 @@ def _run_pipeline(
 # ---------------------------------------------------------------------------
 
 @app.function(
-    gpu="A10G",               # High-speed NVIDIA A10G GPU (24GB VRAM) for maximum throughput
+    gpu="T4",                 # NVIDIA T4 GPU (16GB VRAM) — universally supported on all accounts
     timeout=300,
     scaledown_window=300,     # Keeps the container warm for 5 minutes for instant subsequent runs
     secrets=[roboflow_secret],
@@ -183,7 +183,7 @@ def process_video_task(
 # ---------------------------------------------------------------------------
 
 @app.function(
-    gpu="A10G",               # High-speed NVIDIA A10G GPU (24GB VRAM)
+    gpu="T4",                 # NVIDIA T4 GPU (16GB VRAM)
     timeout=300,
     scaledown_window=300,     # Keeps warm for 5 minutes for zero-latency web requests
     secrets=[roboflow_secret],
