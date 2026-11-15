@@ -159,8 +159,9 @@ def _run_pipeline(
 # ---------------------------------------------------------------------------
 
 @app.function(
-    gpu="T4",                 # Default: T4 GPU (~$0.59/hr = ~$0.0016 per clip). Can switch to "A10G".
+    gpu="A10G",               # High-speed NVIDIA A10G GPU (24GB VRAM) for maximum throughput
     timeout=300,
+    scaledown_window=300,     # Keeps the container warm for 5 minutes for instant subsequent runs
     secrets=[roboflow_secret],
 )
 def process_video_task(
@@ -177,8 +178,9 @@ def process_video_task(
 # ---------------------------------------------------------------------------
 
 @app.function(
-    gpu="T4",                 # Uses T4 GPU for low-cost, high-speed execution
+    gpu="A10G",               # High-speed NVIDIA A10G GPU (24GB VRAM)
     timeout=300,
+    scaledown_window=300,     # Keeps warm for 5 minutes for zero-latency web requests
     secrets=[roboflow_secret],
 )
 @modal.asgi_app()
