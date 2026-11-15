@@ -22,7 +22,8 @@ CourtView Live delivers an interactive NBA broadcast experience directly in the 
 - **Live Telemetry HUD Bar** — Instant readout of current speed (km/h) with visual gauge, cumulative distance covered (m), automated court zone classification (`Paint`, `Left/Right Corner 3`, `Left/Right Wing`, `Top of Key`, `Midrange`, `Backcourt`), and tracking state (`LIVE` vs. `PREDICTED`).
 - **Occlusion Handling & Predictive Tracking** — Short visual occlusions ($\le 25$ frames) are linearly interpolated, rendering dashed floor rings and marking status as `PREDICTED` to prevent flickering.
 - **High-Contrast Multi-Layer Rendering** — All floor rings, contours, brackets, and badges feature dark outer casings + crisp white inner bands + team color cores, ensuring maximum readability on any court wood grain, painted paint, or jersey color.
-- **Multi-Clip Switcher** — Header dropdown with real broadcast clips from Celtics vs. Knicks and an offline synthetic 5v5 simulator.
+- **Multi-Clip Switcher & Dynamic Upload** — Header dropdown with real broadcast clips from Celtics vs. Knicks, an offline synthetic 5v5 simulator, plus a **Phase 2 Upload Modal** to drag-and-drop any `.mp4` clip for automated cloud GPU tracking or instant demo telemetry.
+- **Phase 2 Serverless GPU Worker (Modal.com)** — Automated on-demand GPU pipeline (`pipeline/modal_app.py`) running on NVIDIA A10G GPUs with instant cold starts (~2-3s), REST API endpoint with CORS, and pay-per-second billing ($0 standby cost).
 
 ---
 
@@ -153,12 +154,14 @@ node verify_dom.js
 ```text
 basketball-stream-tracker/
 ├── pipeline/
+│   ├── modal_app.py               # Phase 2: Serverless GPU pipeline & REST endpoint (Modal.com)
 │   ├── extract_telemetry.py       # Main CV pipeline (RF-DETR + SAM2/ByteTrack + Homography)
 │   ├── track_utils.py             # ID-swap repair, track stitching, 10-player cap, Lab clustering
 │   ├── trajectory_smoother.py     # MAD outlier rejection + Savitzky-Golay / EMA smoothing
 │   ├── generate_mock_telemetry.py # Standalone 450-frame 5v5 NBA possession data generator
 │   ├── test_pipeline.py           # Offline unit and integration test suite (with stub detectors)
 │   ├── colab_pipeline.ipynb       # Ready-to-run Google Colab GPU notebook
+│   ├── README_MODAL.md            # Phase 2 Modal.com serverless GPU setup & deployment guide
 │   ├── README_COLAB.md            # Step-by-step Colab execution instructions
 │   └── requirements.txt           # Python CV dependencies
 ├── web/
@@ -176,15 +179,18 @@ basketball-stream-tracker/
 │   │   │   ├── StreamPlayer.tsx   # HTML5 <video> + canvas overlay + transport bar
 │   │   │   ├── RosterSidebar.tsx  # Active roster menu + tracking & visual mode toggles
 │   │   │   ├── CourtRadar2D.tsx   # Scaled 2D NBA court SVG minimap + 60-frame trails
-│   │   │   └── PlayerStatsBar.tsx # Real-time speed, distance, court zone, and status HUD
+│   │   │   ├── PlayerStatsBar.tsx # Real-time speed, distance, court zone, and status HUD
+│   │   │   └── UploadModal.tsx    # Phase 2: Interactive video upload & GPU trigger modal
 │   │   ├── hooks/
 │   │   │   └── useVideoSync.ts    # Frame synchronization hook (rVFC + timer fallback)
 │   │   ├── utils/
 │   │   │   └── canvasDraw.ts      # High-contrast 2K floor rings, neon contours, HUD brackets
-│   │   ├── App.tsx                # Main dashboard layout and clip manager
+│   │   ├── App.tsx                # Main dashboard layout, clip manager & upload handler
 │   │   └── main.tsx               # Entry point
 │   ├── verify_clips.js            # Automated clip playback & sync test runner
 │   ├── verify_dom.js              # 40-assertion browser DOM & interaction test runner
+│   ├── verify_upload_modal.js     # Phase 2 upload modal UI verification test
+│   ├── verify_upload_flow.js      # Phase 2 end-to-end video upload & playback test runner
 │   ├── package.json
 │   ├── tailwind.config.js
 │   └── vite.config.ts

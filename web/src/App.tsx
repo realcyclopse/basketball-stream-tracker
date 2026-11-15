@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Loader2, Radio } from 'lucide-react';
+import { Loader2, Radio, Upload } from 'lucide-react';
 import { TelemetryData, RosterData, HighlightMode, ClipInfo, ClipManifest } from './types/telemetry';
 import { StreamPlayer } from './components/StreamPlayer';
 import { RosterSidebar } from './components/RosterSidebar';
 import { CourtRadar2D } from './components/CourtRadar2D';
 import { PlayerStatsBar } from './components/PlayerStatsBar';
+import { UploadModal, UploadResult } from './components/UploadModal';
 
 const CLIPS_URL = `${import.meta.env.BASE_URL}clips/`;
 
@@ -80,12 +81,37 @@ function App() {
   const [clipId, setClipId] = useState<string | null>(initialClipId);
   const [loaded, setLoaded] = useState<LoadedClip | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isUploadOpen, setIsUploadOpen] = useState(false);
 
   const [selectedPlayerId, setSelectedPlayerId] = useState<number | null>(null);
   const [highlightMode, setHighlightMode] = useState<HighlightMode>('ring');
   const [showUnselected, setShowUnselected] = useState(true);
   const [showTrail, setShowTrail] = useState(true);
   const [currentFrame, setCurrentFrame] = useState(0);
+
+  const handleClipLoaded = useCallback((result: UploadResult) => {
+    const newClip: ClipInfo = {
+      id: result.clipId,
+      title: result.title,
+      subtitle: result.subtitle,
+      video: result.videoBlobUrl,
+      fps: result.fps,
+      frames: result.frames,
+      width: result.width,
+      height: result.height,
+    };
+
+    setClips((prev) => (prev ? [newClip, ...prev] : [newClip]));
+    setClipId(newClip.id);
+    setLoaded({
+      clip: newClip,
+      telemetry: result.telemetry,
+      roster: result.roster,
+      tracked: true,
+    });
+    setSelectedPlayerId(1);
+    setCurrentFrame(0);
+  }, []);
 
   useEffect(() => {
     fetchJson<ClipManifest>(`${CLIPS_URL}clips.json`).then((manifest) => {
@@ -103,6 +129,11 @@ function App() {
   useEffect(() => {
     const clip = clips?.find((c) => c.id === clipId);
     if (!clip) return;
+
+    // If this is an uploaded clip that is already loaded into state, don't re-fetch
+    if (loaded && loaded.clip.id === clipId && clip.video?.startsWith('blob:')) {
+      return;
+    }
 
     let cancelled = false;
     setLoaded(null);
@@ -178,24 +209,36 @@ function App() {
           </span>
         </div>
 
-        {/* Clip Picker */}
-        <nav id="clip-picker" className="flex items-center gap-1 overflow-x-auto">
-          {clips.map((c) => (
-            <button
-              key={c.id}
-              data-clip={c.id}
-              onClick={() => setClipId(c.id)}
-              title={c.subtitle}
-              className={`px-3 py-1 rounded-lg text-xs font-semibold whitespace-nowrap border transition-colors ${
-                c.id === clip.id
-                  ? 'bg-blue-600/20 text-blue-300 border-blue-500/40'
-                  : 'bg-gray-800/60 text-gray-400 border-transparent hover:text-gray-200'
-              }`}
-            >
-              {c.title}
-            </button>
-          ))}
-        </nav>
+        {/* Clip Picker & Upload Button */}
+        <div className="flex items-center gap-2 overflow-x-auto">
+          <nav id="clip-picker" className="flex items-center gap-1">
+            {clips.map((c) => (
+              <button
+                key={c.id}
+                data-clip={c.id}
+                onClick={() => setClipId(c.id)}
+                title={c.subtitle}
+                className={`px-3 py-1 rounded-lg text-xs font-semibold whitespace-nowrap border transition-colors ${
+                  c.id === clip.id
+                    ? 'bg-blue-600/20 text-blue-300 border-blue-500/40'
+                    : 'bg-gray-800/60 text-gray-400 border-transparent hover:text-gray-200'
+                }`}
+              >
+                {c.title}
+              </button>
+            ))}
+          </nav>
+
+          <button
+            id="upload-clip-btn"
+            onClick={() => setIsUploadOpen(true)}
+            title="Upload a new broadcast clip for automated GPU tracking"
+            className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold text-blue-400 bg-blue-600/10 hover:bg-blue-600/25 border border-blue-500/30 transition-all shrink-0"
+          >
+            <Upload className="w-3.5 h-3.5" />
+            <span>Upload Clip</span>
+          </button>
+        </div>
 
         <div className="flex items-center gap-2 shrink-0">
           <div className={`w-2 h-2 rounded-full ${tracked ? 'bg-red-500 animate-pulse' : 'bg-gray-600'}`} />
@@ -230,7 +273,13 @@ function App() {
             key={clip.id}
             telemetry={telemetry}
             roster={roster}
-            videoSrc={clip.video ? `${CLIPS_URL}${clip.id}/${clip.video}` : null}
+            videoSrc={
+              clip.video
+                ? (clip.video.startsWith('blob:') || clip.video.startsWith('http')
+                    ? clip.video
+                    : `${CLIPS_URL}${clip.id}/${clip.video}`)
+                : null
+            }
             notice={
               tracked
                 ? null
@@ -266,6 +315,13 @@ function App() {
           currentFrame={frame}
         />
       </div>
+
+      {/* Phase 2: Upload Modal */}
+      <UploadModal
+        isOpen={isUploadOpen}
+        onClose={() => setIsUploadOpen(false)}
+        onClipLoaded={handleClipLoaded}
+      />
     </div>
   );
 }
