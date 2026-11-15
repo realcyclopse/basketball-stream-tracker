@@ -30,13 +30,13 @@ export function useVideoSync(
   const frameAccumulatorRef = useRef<number>(0);
 
   // Sync frame from native video element
-  const updateFrameFromVideo = useCallback(() => {
+  // `mediaTime` is the exact presentation time of the frame on screen
+  // (requestVideoFrameCallback); currentTime is the fallback.
+  const updateFrameFromVideo = useCallback((mediaTime?: number) => {
     const video = videoRef.current;
     if (!video || fallbackMode) return;
-    const frame = Math.min(
-      Math.floor(video.currentTime * fps),
-      totalFrames - 1
-    );
+    const time = typeof mediaTime === 'number' ? mediaTime : video.currentTime;
+    const frame = Math.min(Math.floor(time * fps + 0.01), totalFrames - 1);
     setCurrentFrame(Math.max(0, frame));
   }, [videoRef, fps, totalFrames, fallbackMode]);
 
@@ -78,6 +78,7 @@ export function useVideoSync(
       setDuration(video.duration || totalFrames / fps);
     };
     const onTimeUpdate = () => updateFrameFromVideo();
+    const onEnded = () => setIsPlaying(false);
     const onSeeked = () => updateFrameFromVideo();
 
     video.addEventListener('play', onPlay);
@@ -85,16 +86,18 @@ export function useVideoSync(
     video.addEventListener('loadedmetadata', onLoadedMetadata);
     video.addEventListener('timeupdate', onTimeUpdate);
     video.addEventListener('seeked', onSeeked);
+    video.addEventListener('ended', onEnded);
 
     // requestVideoFrameCallback support
     let rvfcActive = true;
     if ('requestVideoFrameCallback' in video) {
-      const rvfcLoop = () => {
+      const rvfcLoop = (_now: number, frameInfo?: { mediaTime: number }) => {
         if (!rvfcActive) return;
-        updateFrameFromVideo();
+        updateFrameFromVideo(frameInfo?.mediaTime);
         (video as any).requestVideoFrameCallback(rvfcLoop);
       };
       (video as any).requestVideoFrameCallback(rvfcLoop);
+      updateFrameFromVideo();
     } else {
       const rAfLoop = () => {
         updateFrameFromVideo();
@@ -110,6 +113,7 @@ export function useVideoSync(
       video.removeEventListener('loadedmetadata', onLoadedMetadata);
       video.removeEventListener('timeupdate', onTimeUpdate);
       video.removeEventListener('seeked', onSeeked);
+      video.removeEventListener('ended', onEnded);
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
   }, [videoRef, fallbackMode, updateFrameFromVideo, totalFrames, fps]);
@@ -146,6 +150,18 @@ export function useVideoSync(
     }
   }, [fallbackMode, videoRef]);
 
+  // Seeks to the middle of the frame so rounding never lands on a neighbour.
+  const seekToFrame = useCallback(
+    (frame: number) => {
+      const clamped = Math.max(0, Math.min(frame, totalFrames - 1));
+      setCurrentFrame(clamped);
+      if (!fallbackMode && videoRef.current) {
+        videoRef.current.currentTime = (clamped + 0.5) / fps;
+      }
+    },
+    [fallbackMode, videoRef, fps, totalFrames]
+  );
+
   const stepForward = useCallback(() => {
     if (fallbackMode) {
       setIsPlaying(false);
@@ -154,10 +170,9 @@ export function useVideoSync(
       const video = videoRef.current;
       if (!video) return;
       video.pause();
-      video.currentTime = Math.min(video.currentTime + 1 / fps, video.duration);
-      updateFrameFromVideo();
+      seekToFrame(Math.floor(video.currentTime * fps + 0.01) + 1);
     }
-  }, [fallbackMode, videoRef, fps, totalFrames, updateFrameFromVideo]);
+  }, [fallbackMode, videoRef, fps, totalFrames, seekToFrame]);
 
   const stepBackward = useCallback(() => {
     if (fallbackMode) {
@@ -167,10 +182,9 @@ export function useVideoSync(
       const video = videoRef.current;
       if (!video) return;
       video.pause();
-      video.currentTime = Math.max(video.currentTime - 1 / fps, 0);
-      updateFrameFromVideo();
+      seekToFrame(Math.floor(video.currentTime * fps + 0.01) - 1);
     }
-  }, [fallbackMode, videoRef, fps, totalFrames, updateFrameFromVideo]);
+  }, [fallbackMode, videoRef, fps, totalFrames, seekToFrame]);
 
   const setPlaybackRate = useCallback(
     (rate: number) => {
@@ -180,18 +194,6 @@ export function useVideoSync(
       }
     },
     [fallbackMode, videoRef]
-  );
-
-  const seekToFrame = useCallback(
-    (frame: number) => {
-      const clamped = Math.max(0, Math.min(frame, totalFrames - 1));
-      setCurrentFrame(clamped);
-      if (!fallbackMode && videoRef.current) {
-        videoRef.current.currentTime = clamped / fps;
-        updateFrameFromVideo();
-      }
-    },
-    [fallbackMode, videoRef, fps, totalFrames, updateFrameFromVideo]
   );
 
   return {

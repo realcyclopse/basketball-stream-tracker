@@ -1,0 +1,44 @@
+{
+  "clips": [
+    {
+      "id": "bos-nyk-q1-0428",
+      "title": "Q1 · 4:28",
+      "subtitle": "Celtics vs Knicks · Game 1",
+      "video": "video.mp4",
+      "fps": 30,
+      "frames": 238,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": "bos-nyk-q1-0741",
+      "title": "Q1 · 7:41",
+      "subtitle": "Celtics vs Knicks · Game 1",
+      "video": "video.mp4",
+      "fps": 30,
+      "frames": 209,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": "bos-nyk-q2-0843",
+      "title": "Q2 · 8:43",
+      "subtitle": "Celtics vs Knicks · Game 1",
+      "video": "video.mp4",
+      "fps": 30,
+      "frames": 201,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": "synthetic",
+      "title": "Synthetic",
+      "subtitle": "Mock telemetry · no video",
+      "video": null,
+      "fps": 30,
+      "frames": 450,
+      "width": 1920,
+      "height": 1080
+    }
+  ]
+}

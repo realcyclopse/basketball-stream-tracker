@@ -46,7 +46,7 @@ export function CourtRadar2D({
       const f = telemetry.frames[i];
       if (!f) continue;
       const p = f.players.find((pl: PlayerFrame) => pl.id === selectedPlayerId);
-      if (p) points.push(p.court_xy);
+      if (p?.court_xy) points.push(p.court_xy);
     }
     return points;
   }, [telemetry, selectedPlayerId, currentFrame, showTrail]);
@@ -58,8 +58,8 @@ export function CourtRadar2D({
   const keyWidth = 579;        // 19ft to free throw line = 579cm
   const keyHalfH = 244;        // 16ft lane width = 488cm, half is 244cm
   const threeRadius = 724;     // 23ft 9in arc radius
-  const cornerThreeDist = 670; // 22ft in corners from hoop
-  const cornerStraightX = 427; // 14ft straight line from baseline
+  const cornerThreeDist = 671; // corner three runs 91cm inside each sideline
+  const cornerStraightX = 424; // straight section, baseline to arc
   const ftCircleR = 183;       // 6ft radius
   const centerCircleR = 183;   // 6ft radius
   const rimR = 23;             // 18in rim diameter, ~23cm radius
@@ -264,6 +264,7 @@ export function CourtRadar2D({
           {/* ───────── 10 On-Court Players ───────── */}
           {frameData &&
             frameData.players.map((p: PlayerFrame) => {
+              if (!p.court_xy) return null; // no court position this frame
               const isSelected = p.id === selectedPlayerId;
               const color = getTeamColor(p.id);
               const player = roster.players[String(p.id)];
@@ -271,14 +272,14 @@ export function CourtRadar2D({
               const cy = pad + p.court_xy[1];
 
               if (isSelected) {
-                // Directional velocity vector calculation (looking 4 frames ahead)
-                const lookaheadFrame = telemetry.frames[Math.min(currentFrame + 4, metadata.total_frames - 1)];
-                const lookaheadPlayer = lookaheadFrame?.players.find((np) => np.id === p.id);
+                // Velocity vector from the motion over the last 4 frames
+                const pastPlayer = telemetry.frames[Math.max(0, currentFrame - 4)]
+                  ?.players.find((np) => np.id === p.id);
                 let vecDx = 0;
                 let vecDy = 0;
-                if (lookaheadPlayer) {
-                  vecDx = (lookaheadPlayer.court_xy[0] - p.court_xy[0]) * 3.5;
-                  vecDy = (lookaheadPlayer.court_xy[1] - p.court_xy[1]) * 3.5;
+                if (pastPlayer?.court_xy) {
+                  vecDx = (p.court_xy[0] - pastPlayer.court_xy[0]) * 3.5;
+                  vecDy = (p.court_xy[1] - pastPlayer.court_xy[1]) * 3.5;
                 }
 
                 return (
@@ -343,7 +344,7 @@ export function CourtRadar2D({
                       fontWeight="800"
                       fontFamily="Inter, sans-serif"
                     >
-                      {player?.number}
+                      {player?.number ?? p.id}
                     </text>
                   </g>
                 );
@@ -374,7 +375,7 @@ export function CourtRadar2D({
                     fontWeight="700"
                     fontFamily="Inter, sans-serif"
                   >
-                    {player?.number}
+                    {player?.number ?? p.id}
                   </text>
                 </g>
               );

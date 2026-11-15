@@ -1,97 +1,60 @@
 """
-trajectory_smoother.py — Trajectory smoothing and de-jittering module
-for basketball live-stream player tracking.
+trajectory_smoother.py — Trajectory cleaning for basketball player tracking.
 
-Implements mathematical solutions for critical CV edge cases:
-  1. Edge Case 1: "Jumping Player" Homography Teleportation Bug
-     - Euclidean displacement dt = ||p_t - p_{t-1}||
-     - Median M and Median Absolute Deviation (MAD = median(|dt - M|))
-     - Outlier threshold: dt > M + 3.5 * MAD and dt > 45 cm/frame
-     - Pad outlier window by +/-2 frames and linear interpolation
-     - Savitzky-Golay filter (window_length=7, polyorder=2) or EMA (alpha=0.30)
-     - Clamp coordinates strictly within [0, court_width] x [0, court_height]
-  2. Edge Case 2: Insufficient court keypoints / homography failure handling
-  3. Edge Case 3: Temporary player occlusion (gap <= 25 frames)
-     - Linear interpolation of bbox, feet_video_xy, court_xy, polygon
-     - Marks is_interpolated = True for predicted frames
+Takes the raw per-frame output of extract_telemetry.py and makes it fit for
+the web viewer:
+
+  1. Occlusion gaps (Edge Case 3): a player missing for <= 25 frames who
+     reappears with the same id gets linearly interpolated bbox / feet /
+     court position, flagged "is_interpolated": true.
+  2. Jump rejection (Edge Case 1): frame-to-frame court displacements d_t are
+     tested against d_t > M + 3.5 * MAD and d_t > 45 cm/frame. Outliers are
+     padded by +/-2 frames, removed, and rebuilt by linear interpolation.
+  3. Missing homography (Edge Case 2): frames with court_xy = None are
+     interpolated from their neighbours.
+  4. Savitzky-Golay smoothing (window 7, polyorder 2), EMA (alpha 0.30) when
+     scipy is unavailable or the track is too short.
+  5. Clamp to [0, court_width] x [0, court_height].
+  6. speed_kmh recomputed from the cleaned positions.
+
+Input player dicts use "court_xy": [x, y] or None (no homography).
+A player whose track has no valid court position at all keeps court_xy None.
 """
 
 from __future__ import annotations
 
 import copy
-import math
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-# Try importing scipy.signal for Savitzky-Golay filtering
 try:
     from scipy.signal import savgol_filter
     _HAS_SCIPY = True
 except ImportError:
     _HAS_SCIPY = False
 
+MAX_OCCLUSION_GAP = 25      # frames
+MAD_FACTOR = 3.5
+MIN_JUMP_CM = 45.0          # cm per frame
+JUMP_PAD = 2                # frames either side of an outlier
+MAX_JUMP_RUN = 20           # two outliers this close bracket one airborne run
+SAVGOL_WINDOW = 7
+SAVGOL_POLY = 2
+EMA_ALPHA = 0.30
+SPEED_WINDOW = 3            # frames used for the speed estimate
+MAX_SPEED_KMH = 40.0
 
-def compute_speed_kmh(
-    prev_xy: Sequence[float],
-    curr_xy: Sequence[float],
-    fps: float,
-) -> float:
-    """
-    Compute instantaneous speed in km/h between two court positions (in cm).
-    """
+
+def compute_speed_kmh(prev_xy: Sequence[float], curr_xy: Sequence[float], fps: float) -> float:
+    """Speed in km/h between two court positions (cm) one frame apart at `fps`."""
     if fps <= 0:
         return 0.0
-
-    dx = curr_xy[0] - prev_xy[0]
-    dy = curr_xy[1] - prev_xy[1]
-    dist_cm = math.sqrt(dx * dx + dy * dy)
-    dist_m = dist_cm / 100.0
-    speed_ms = dist_m * fps
-    return round(speed_ms * 3.6, 1)
+    dist_cm = float(np.hypot(curr_xy[0] - prev_xy[0], curr_xy[1] - prev_xy[1]))
+    return round(dist_cm / 100.0 * fps * 3.6, 1)
 
 
-def _get_player_list(frame: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Helper to get player list from frame using either 'players' or 'detections'."""
-    if "players" in frame:
-        return frame["players"]
-    elif "detections" in frame:
-        return frame["detections"]
-    return []
-
-
-def _get_player_id(player_dict: Dict[str, Any]) -> Optional[int]:
-    """Helper to extract player id regardless of key naming."""
-    for key in ("id", "player_id", "tracker_id"):
-        if key in player_dict and player_dict[key] is not None:
-            try:
-                return int(player_dict[key])
-            except (ValueError, TypeError):
-                pass
-    return None
-
-
-def _get_court_xy(player_dict: Dict[str, Any]) -> Optional[List[float]]:
-    """Helper to extract [court_x, court_y] from player dict."""
-    for key in ("court_xy", "feet_court"):
-        val = player_dict.get(key)
-        if val is not None and len(val) >= 2 and val[0] is not None and val[1] is not None:
-            return [float(val[0]), float(val[1])]
-    return None
-
-
-def _set_court_xy(player_dict: Dict[str, Any], xy: List[float]) -> None:
-    """Set court coordinates back onto player dict."""
-    if "court_xy" in player_dict:
-        player_dict["court_xy"] = [round(xy[0], 1), round(xy[1], 1)]
-    elif "feet_court" in player_dict:
-        player_dict["feet_court"] = [round(xy[0], 1), round(xy[1], 1)]
-    else:
-        player_dict["court_xy"] = [round(xy[0], 1), round(xy[1], 1)]
-
-
-def _ema_smooth(values: np.ndarray, alpha: float = 0.30) -> np.ndarray:
-    """Causal Exponential Moving Average (EMA) smoothing."""
+def _ema_smooth(values: np.ndarray, alpha: float = EMA_ALPHA) -> np.ndarray:
     smoothed = np.empty_like(values, dtype=np.float64)
     smoothed[0] = values[0]
     for i in range(1, len(values)):
@@ -100,211 +63,176 @@ def _ema_smooth(values: np.ndarray, alpha: float = 0.30) -> np.ndarray:
 
 
 def _smooth_series(values: np.ndarray) -> np.ndarray:
-    """Apply Savitzky-Golay (or EMA fallback) over 1-D coordinate values."""
-    n = len(values)
-    if _HAS_SCIPY and n >= 7:
-        try:
-            return savgol_filter(values, window_length=7, polyorder=2)
-        except Exception:
-            pass
-    return _ema_smooth(values, alpha=0.30)
+    if _HAS_SCIPY and len(values) >= SAVGOL_WINDOW:
+        return savgol_filter(values, window_length=SAVGOL_WINDOW, polyorder=SAVGOL_POLY, mode="interp")
+    return _ema_smooth(values)
 
 
-def _lerp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * t
+def _interp_nan(values: np.ndarray) -> np.ndarray:
+    """Linear interpolation over NaNs; edges hold the nearest valid value."""
+    out = values.copy()
+    nan = np.isnan(out)
+    if nan.all() or not nan.any():
+        return out
+    x = np.arange(len(out))
+    out[nan] = np.interp(x[nan], x[~nan], out[~nan])
+    return out
 
 
-def _lerp_list(a: Sequence[float], b: Sequence[float], t: float) -> List[float]:
-    return [_lerp(ai, bi, t) for ai, bi in zip(a, b)]
+def find_jump_outliers(xy: np.ndarray) -> np.ndarray:
+    """
+    Boolean mask of samples corrupted by homography "teleports".
+
+    xy is (n, 2) with NaN rows where the position is unknown.
+    """
+    n = len(xy)
+    bad = np.zeros(n, dtype=bool)
+    idx = np.flatnonzero(~np.isnan(xy[:, 0]))
+    if len(idx) < 4:
+        return bad
+
+    steps = np.diff(idx)
+    d = np.hypot(*np.diff(xy[idx], axis=0).T) / steps   # cm per frame
+    median = float(np.median(d))
+    mad = float(np.median(np.abs(d - median)))
+    spikes = idx[1:][(d > median + MAD_FACTOR * mad) & (d > MIN_JUMP_CM)]
+    if len(spikes) == 0:
+        return bad
+
+    bad[spikes] = True
+    # A jump shows as a spike on take-off and another on landing; everything
+    # in between is displaced too.
+    for a, b in zip(spikes[:-1], spikes[1:]):
+        if b - a <= MAX_JUMP_RUN:
+            bad[a:b + 1] = True
+    for i in np.flatnonzero(bad):
+        bad[max(0, i - JUMP_PAD):min(n, i + JUMP_PAD + 1)] = True
+
+    # If most of the track is flagged the statistics are meaningless — keep it.
+    if bad[idx].mean() > 0.6:
+        return np.zeros(n, dtype=bool)
+    return bad
 
 
-def _lerp_polygon(
-    poly_a: List[List[float]],
-    poly_b: List[List[float]],
-    t: float,
-) -> List[List[float]]:
-    """Interpolate two polygon vertex lists."""
-    if not poly_a and not poly_b:
-        return []
-    if not poly_a:
-        return poly_b
-    if not poly_b:
-        return poly_a
+def clean_court_path(xy: np.ndarray, court_w: float, court_h: float) -> Optional[np.ndarray]:
+    """Reject jumps, fill gaps, smooth and clamp one contiguous (n, 2) court path."""
+    xy = np.asarray(xy, dtype=np.float64).copy()
+    if np.isnan(xy[:, 0]).all():
+        return None
 
-    max_len = max(len(poly_a), len(poly_b))
-    pa = poly_a + [poly_a[-1]] * (max_len - len(poly_a))
-    pb = poly_b + [poly_b[-1]] * (max_len - len(poly_b))
-    return [_lerp_list(va, vb, t) for va, vb in zip(pa, pb)]
+    xy[find_jump_outliers(xy)] = np.nan
+    x = _smooth_series(_interp_nan(xy[:, 0]))
+    y = _smooth_series(_interp_nan(xy[:, 1]))
+    return np.stack([np.clip(x, 0.0, court_w), np.clip(y, 0.0, court_h)], axis=1)
+
+
+def _lerp(a: Sequence[float], b: Sequence[float], t: float) -> List[float]:
+    return [float(ai + (bi - ai) * t) for ai, bi in zip(a, b)]
+
+
+def _shift_polygon(polygon: List[List[float]], dx: float, dy: float) -> List[List[float]]:
+    return [[round(px + dx, 1), round(py + dy, 1)] for px, py in polygon]
+
+
+def _fill_gap(start: Dict[str, Any], end: Dict[str, Any], gap: int) -> List[Dict[str, Any]]:
+    """Synthesize `gap` interpolated player entries between two observations."""
+    filled = []
+    for step in range(1, gap + 1):
+        t = step / (gap + 1)
+        feet = _lerp(start["feet_video_xy"], end["feet_video_xy"], t)
+        # Polygons have different vertex counts, so carry the nearer one along.
+        src = start if t < 0.5 else end
+        polygon = _shift_polygon(
+            src.get("polygon") or [],
+            feet[0] - src["feet_video_xy"][0],
+            feet[1] - src["feet_video_xy"][1],
+        )
+        court = None
+        if start.get("court_xy") is not None and end.get("court_xy") is not None:
+            court = _lerp(start["court_xy"], end["court_xy"], t)
+        filled.append({
+            "id": start["id"],
+            "bbox": [round(v, 1) for v in _lerp(start["bbox"], end["bbox"], t)],
+            "feet_video_xy": [round(v, 1) for v in feet],
+            "polygon": polygon,
+            "court_xy": court,
+            "speed_kmh": 0.0,
+            "is_interpolated": True,
+        })
+    return filled
+
+
+def _speeds(xy: np.ndarray, fps: float) -> np.ndarray:
+    n = len(xy)
+    speeds = np.zeros(n)
+    for i in range(n):
+        lo = max(0, i - SPEED_WINDOW)
+        hi = i
+        if lo == hi:                     # first frame: look forward instead
+            hi = min(n - 1, i + SPEED_WINDOW)
+        if hi == lo:
+            continue
+        dist_cm = float(np.hypot(*(xy[hi] - xy[lo])))
+        speeds[i] = dist_cm / 100.0 * fps / (hi - lo) * 3.6
+    return np.clip(speeds, 0.0, MAX_SPEED_KMH)
 
 
 def smooth_trajectories(
     frames_data: List[Dict[str, Any]],
     metadata: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Run trajectory de-jittering, jump outlier rejection, and occlusion interpolation.
-
-    Parameters
-    ----------
-    frames_data : list[dict]
-        Frame-indexed player tracking data.
-    metadata : dict, optional
-        Contains court_width (cm), court_height (cm), and fps.
-
-    Returns
-    -------
-    list[dict]
-        Cleaned, smoothed frames data conforming to Section 4.2 data contract.
-    """
+    """Clean every player's trajectory. Returns a new frames list."""
     frames = copy.deepcopy(frames_data)
     if not frames:
         return frames
 
-    # Extract metadata bounds with defaults
-    court_w = float((metadata or {}).get("court_width", 2865.0))
-    court_h = float((metadata or {}).get("court_height", 1524.0))
-    fps = float((metadata or {}).get("fps", 30.0))
+    meta = metadata or {}
+    court_w = float(meta.get("court_width", 2865.0))
+    court_h = float(meta.get("court_height", 1524.0))
+    fps = float(meta.get("fps", 30.0)) or 30.0
 
-    # Identify all unique player IDs present across frames
-    all_player_ids = set()
-    for frame in frames:
-        for p in _get_player_list(frame):
-            pid = _get_player_id(p)
-            if pid is not None:
-                all_player_ids.add(pid)
+    tracks: Dict[int, Dict[int, Dict[str, Any]]] = {}
+    for fi, frame in enumerate(frames):
+        for player in frame["players"]:
+            tracks.setdefault(int(player["id"]), {})[fi] = player
 
-    # Process each player trajectory individually
-    for pid in sorted(all_player_ids):
-        # Collect occurrences: (frame_idx, player_idx_in_frame)
-        occurrences: List[Tuple[int, int]] = []
-        for fi, frame in enumerate(frames):
-            plist = _get_player_list(frame)
-            for pi, p in enumerate(plist):
-                if _get_player_id(p) == pid:
-                    occurrences.append((fi, pi))
-                    break
+    for pid, track in tracks.items():
+        present = sorted(track)
 
-        if len(occurrences) < 2:
-            continue
+        # Occlusion gaps
+        for a, b in zip(present[:-1], present[1:]):
+            gap = b - a - 1
+            if 0 < gap <= MAX_OCCLUSION_GAP:
+                for offset, player in enumerate(_fill_gap(track[a], track[b], gap), start=1):
+                    track[a + offset] = player
+                    frames[a + offset]["players"].append(player)
 
-        frame_indices = np.array([fi for fi, _ in occurrences], dtype=int)
-        raw_coords = []
-        for fi, pi in occurrences:
-            p = _get_player_list(frames[fi])[pi]
-            cxy = _get_court_xy(p) or [court_w / 2.0, court_h / 2.0]
-            raw_coords.append(cxy)
-
-        coords_arr = np.array(raw_coords, dtype=np.float64)  # (N, 2)
-        n_points = len(coords_arr)
-
-        # ── Step A: Outlier Jump Rejection (Edge Case 1) ───────────
-        diffs = np.diff(coords_arr, axis=0)
-        displacements = np.sqrt(diffs[:, 0] ** 2 + diffs[:, 1] ** 2)
-
-        if len(displacements) > 0:
-            median_d = float(np.median(displacements))
-            mad_d = float(np.median(np.abs(displacements - median_d)))
-            threshold = median_d + 3.5 * mad_d
-
-            outlier_indices = set()
-            for k, d in enumerate(displacements):
-                if d > threshold and d > 45.0:  # > 45 cm/frame jump
-                    outlier_indices.add(k + 1)
-
-            # Pad each outlier window by +/- 2 frames
-            corrupted = set()
-            for idx in outlier_indices:
-                for offset in range(-2, 3):
-                    cur = idx + offset
-                    if 0 <= cur < n_points:
-                        corrupted.add(cur)
-
-            # Reconstruct corrupted coordinates via linear interpolation
-            valid_mask = np.ones(n_points, dtype=bool)
-            for c in corrupted:
-                valid_mask[c] = False
-
-            if np.any(valid_mask):
-                valid_idx = np.where(valid_mask)[0]
-                coords_arr[:, 0] = np.interp(np.arange(n_points), valid_idx, coords_arr[valid_idx, 0])
-                coords_arr[:, 1] = np.interp(np.arange(n_points), valid_idx, coords_arr[valid_idx, 1])
-
-        # ── Step B: Smoothing filter (Savitzky-Golay / EMA) ────────
-        smooth_x = _smooth_series(coords_arr[:, 0])
-        smooth_y = _smooth_series(coords_arr[:, 1])
-
-        # ── Step C: Clamping strictly within court boundaries ──────
-        smooth_x = np.clip(smooth_x, 10.0, court_w - 10.0)
-        smooth_y = np.clip(smooth_y, 10.0, court_h - 10.0)
-
-        # Write smoothed coordinates back
-        for arr_idx, (fi, pi) in enumerate(occurrences):
-            p = _get_player_list(frames[fi])[pi]
-            _set_court_xy(p, [smooth_x[arr_idx], smooth_y[arr_idx]])
-
-        # ── Step D: Handle Occlusion Gaps (Edge Case 3) ────────────
-        # If player disappears for <= 25 frames and reappears with same ID,
-        # linearly interpolate their state and mark is_interpolated = True
-        for i in range(len(occurrences) - 1):
-            fi_start, pi_start = occurrences[i]
-            fi_end, pi_end = occurrences[i + 1]
-            gap = fi_end - fi_start - 1
-
-            if 0 < gap <= 25:
-                p_start = _get_player_list(frames[fi_start])[pi_start]
-                p_end = _get_player_list(frames[fi_end])[pi_end]
-
-                bbox_start = p_start.get("bbox", [0, 0, 50, 150])
-                bbox_end = p_end.get("bbox", [0, 0, 50, 150])
-                feet_start = p_start.get("feet_video_xy", [0, 0])
-                feet_end = p_end.get("feet_video_xy", [0, 0])
-                court_start = _get_court_xy(p_start) or [0, 0]
-                court_end = _get_court_xy(p_end) or [0, 0]
-                poly_start = p_start.get("polygon", [])
-                poly_end = p_end.get("polygon", [])
-
-                for step in range(1, gap + 1):
-                    target_fi = fi_start + step
-                    fraction = step / float(gap + 1)
-
-                    interp_bbox = _lerp_list(bbox_start, bbox_end, fraction)
-                    interp_feet = _lerp_list(feet_start, feet_end, fraction)
-                    interp_court = _lerp_list(court_start, court_end, fraction)
-                    interp_poly = _lerp_polygon(poly_start, poly_end, fraction)
-
-                    # Compute interpolated speed
-                    interp_speed = compute_speed_kmh(court_start, interp_court, fps / step)
-
-                    synthesized_player = {
-                        "id": pid,
-                        "bbox": [round(v, 1) for v in interp_bbox],
-                        "feet_video_xy": [round(v, 1) for v in interp_feet],
-                        "polygon": interp_poly,
-                        "court_xy": [round(interp_court[0], 1), round(interp_court[1], 1)],
-                        "speed_kmh": interp_speed,
-                        "is_interpolated": True,
-                    }
-
-                    target_plist = _get_player_list(frames[target_fi])
-                    target_plist.append(synthesized_player)
-
-        # ── Step E: Recompute Speeds for All Frames ────────────────
-        # Update speed_kmh based on smoothed trajectories
-        player_frames_sorted = sorted(
-            [(fi, p) for fi, frame in enumerate(frames) for p in _get_player_list(frame) if _get_player_id(p) == pid],
-            key=lambda item: item[0],
-        )
-
-        for idx, (fi, p) in enumerate(player_frames_sorted):
-            if idx == 0:
-                p["speed_kmh"] = 10.0
+        # Split into contiguous segments (gaps longer than the limit stay gaps)
+        present = sorted(track)
+        segments: List[List[int]] = [[present[0]]]
+        for fi in present[1:]:
+            if fi == segments[-1][-1] + 1:
+                segments[-1].append(fi)
             else:
-                prev_fi, prev_p = player_frames_sorted[idx - 1]
-                frame_delta = fi - prev_fi
-                if frame_delta > 0:
-                    c_prev = _get_court_xy(prev_p) or [0, 0]
-                    c_curr = _get_court_xy(p) or [0, 0]
-                    effective_fps = fps / float(frame_delta)
-                    p["speed_kmh"] = compute_speed_kmh(c_prev, c_curr, effective_fps)
+                segments.append([fi])
 
+        for segment in segments:
+            raw = np.array(
+                [track[fi]["court_xy"] if track[fi].get("court_xy") is not None else (np.nan, np.nan)
+                 for fi in segment],
+                dtype=np.float64,
+            )
+            cleaned = clean_court_path(raw, court_w, court_h)
+            if cleaned is None:
+                for fi in segment:
+                    track[fi]["court_xy"] = None
+                    track[fi]["speed_kmh"] = 0.0
+                continue
+            speeds = _speeds(cleaned, fps)
+            for k, fi in enumerate(segment):
+                track[fi]["court_xy"] = [round(float(cleaned[k, 0]), 1), round(float(cleaned[k, 1]), 1)]
+                track[fi]["speed_kmh"] = round(float(speeds[k]), 1)
+
+    for frame in frames:
+        frame["players"].sort(key=lambda p: p["id"])
     return frames

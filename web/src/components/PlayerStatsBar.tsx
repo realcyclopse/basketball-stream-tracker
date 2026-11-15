@@ -24,25 +24,26 @@ export function PlayerStatsBar({ telemetry, roster, selectedPlayerId, currentFra
       : roster.match_info.away_team.color;
   }, [playerInfo, roster]);
 
-  // Compute cumulative distance from frame 0 to currentFrame
-  const distanceCovered = useMemo(() => {
-    if (selectedPlayerId === null) return 0;
+  // Cumulative distance (m) per frame for the selected player, built once per
+  // selection so playback only does a lookup.
+  const cumulativeDistance = useMemo(() => {
+    const cumulative = new Float32Array(telemetry.frames.length);
+    if (selectedPlayerId === null) return cumulative;
     let total = 0;
-    for (let i = 1; i <= currentFrame; i++) {
-      const prev = telemetry.frames[i - 1]?.players.find((p: PlayerFrame) => p.id === selectedPlayerId);
-      const curr = telemetry.frames[i]?.players.find((p: PlayerFrame) => p.id === selectedPlayerId);
-      if (prev && curr) {
-        const dx = curr.court_xy[0] - prev.court_xy[0];
-        const dy = curr.court_xy[1] - prev.court_xy[1];
-        total += Math.sqrt(dx * dx + dy * dy);
-      }
-    }
-    return total / 100; // cm to meters
-  }, [telemetry, selectedPlayerId, currentFrame]);
+    let prev: [number, number] | null = null;
+    telemetry.frames.forEach((frame, i) => {
+      const curr = frame.players.find((p: PlayerFrame) => p.id === selectedPlayerId)?.court_xy ?? null;
+      if (prev && curr) total += Math.hypot(curr[0] - prev[0], curr[1] - prev[1]) / 100;
+      prev = curr;
+      cumulative[i] = total;
+    });
+    return cumulative;
+  }, [telemetry, selectedPlayerId]);
+  const distanceCovered = cumulativeDistance[Math.min(currentFrame, cumulativeDistance.length - 1)] ?? 0;
 
-  const courtZone = playerFrame
+  const courtZone = playerFrame?.court_xy
     ? getCourtZone(playerFrame.court_xy, metadata.court_width, metadata.court_height)
-    : null;
+    : '—';
 
   const speed = playerFrame?.speed_kmh ?? 0;
   const speedColor = speed < 15 ? '#22c55e' : speed < 25 ? '#eab308' : '#ef4444';
@@ -119,7 +120,15 @@ export function PlayerStatsBar({ telemetry, roster, selectedPlayerId, currentFra
 
       {/* Tracking Status */}
       <div className="flex items-center gap-2">
-        {playerFrame?.is_interpolated ? (
+        {!playerFrame ? (
+          <>
+            <Radio size={14} className="text-gray-500" />
+            <div>
+              <div className="text-xs text-gray-400">Status</div>
+              <div className="text-sm font-semibold text-gray-500">OFF SCREEN</div>
+            </div>
+          </>
+        ) : playerFrame.is_interpolated ? (
           <>
             <AlertTriangle size={14} className="text-amber-400" />
             <div>

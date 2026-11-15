@@ -20,6 +20,8 @@ export interface PlayerInfo {
 }
 
 export interface RosterData {
+  /** true while names / numbers are pipeline placeholders */
+  draft?: boolean;
   match_info: MatchInfo;
   players: Record<string, PlayerInfo>;
 }
@@ -29,7 +31,8 @@ export interface PlayerFrame {
   bbox: [number, number, number, number];
   feet_video_xy: [number, number];
   polygon: number[][];
-  court_xy: [number, number];
+  /** court position in cm; null when no homography was available */
+  court_xy: [number, number] | null;
   speed_kmh: number;
   is_interpolated: boolean;
 }
@@ -49,6 +52,8 @@ export interface TelemetryMetadata {
   court_width: number;
   court_height: number;
   court_unit: string;
+  source?: string;
+  tracker?: string;
 }
 
 export interface TelemetryData {
@@ -74,4 +79,20 @@ export interface AppState {
   showUnselected: boolean;
   showTrail: boolean;
   currentFrame: number;
+}
+
+export interface ClipInfo {
+  id: string;
+  title: string;
+  subtitle: string;
+  /** file name inside the clip folder; null = no footage (synthetic view) */
+  video: string | null;
+  fps: number;
+  frames: number;
+  width: number;
+  height: number;
+}
+
+export interface ClipManifest {
+  clips: ClipInfo[];
 }

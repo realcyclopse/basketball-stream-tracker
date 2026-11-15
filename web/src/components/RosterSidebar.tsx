@@ -23,11 +23,8 @@ export function RosterSidebar({
 }: RosterSidebarProps) {
   const frameData = telemetry.frames[currentFrame];
 
-  const getPlayerSpeed = (playerId: number): number => {
-    if (!frameData) return 0;
-    const p = frameData.players.find((p: PlayerFrame) => p.id === playerId);
-    return p ? p.speed_kmh : 0;
-  };
+  const getPlayerFrame = (playerId: number): PlayerFrame | undefined =>
+    frameData?.players.find((p: PlayerFrame) => p.id === playerId);
 
   const teams = [
     { info: roster.match_info.home_team, playerIds: Object.values(roster.players).filter(p => p.team === roster.match_info.home_team.code).map(p => p.id) },
@@ -52,6 +49,12 @@ export function RosterSidebar({
         )}
       </div>
 
+      {roster.draft && Object.keys(roster.players).length > 0 && (
+        <div className="px-4 py-2 text-[11px] text-amber-300/80 bg-amber-500/5 border-b border-gray-800">
+          Draft roster: tracker IDs shown. Edit roster.json to set names and numbers.
+        </div>
+      )}
+
       {/* Team Sections */}
       {teams.map((team) => (
         <div key={team.info.code} className="border-b border-gray-800">
@@ -66,7 +69,7 @@ export function RosterSidebar({
           {team.playerIds.map((pid) => {
             const player = roster.players[String(pid)];
             const isSelected = selectedPlayerId === pid;
-            const speed = getPlayerSpeed(pid);
+            const playerFrame = getPlayerFrame(pid);
 
             return (
               <button
@@ -91,15 +94,31 @@ export function RosterSidebar({
                   <div className="text-xs text-gray-500">{player.position}</div>
                 </div>
 
-                {/* Live Status */}
+                {/* Tracking Status */}
                 <div className="flex flex-col items-end gap-0.5 shrink-0">
-                  <div className="flex items-center gap-1">
-                    <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-                    <span className="text-[10px] text-green-400 uppercase font-medium">Live</span>
-                  </div>
-                  <span className="text-[11px] text-gray-400 font-mono">
-                    {speed.toFixed(1)} km/h
-                  </span>
+                  {!playerFrame ? (
+                    <span className="text-[10px] text-gray-600 uppercase font-medium">Off screen</span>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-1">
+                        <div
+                          className={`w-1.5 h-1.5 rounded-full animate-pulse ${
+                            playerFrame.is_interpolated ? 'bg-amber-400' : 'bg-green-500'
+                          }`}
+                        />
+                        <span
+                          className={`text-[10px] uppercase font-medium ${
+                            playerFrame.is_interpolated ? 'text-amber-400' : 'text-green-400'
+                          }`}
+                        >
+                          {playerFrame.is_interpolated ? 'Predicted' : 'Live'}
+                        </span>
+                      </div>
+                      <span className="text-[11px] text-gray-400 font-mono">
+                        {playerFrame.speed_kmh.toFixed(1)} km/h
+                      </span>
+                    </>
+                  )}
                 </div>
               </button>
             );

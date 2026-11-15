@@ -398,57 +398,30 @@ export function drawSubtleDot(
 }
 
 /**
- * Classify court position into zones (NBA court in cm, full court 2865x1524):
- * - Court center Y = courtHeight / 2 = 762
- * - Paint: within 580cm of either baseline AND within 244cm (8ft) of center
- * - 3-point arc: radius 723cm (23ft9in) from hoop center (x=160, y=762 and x=courtWidth-160, y=762)
- *   Corner 3s: behind 3pt line AND within 91cm (3ft) of sideline
- *   Wings: behind 3pt line, not in corners
- * - Backcourt: distFromBaseline > halfCourt
- * - Top of Key: distFromBaseline < 580 and Math.abs(y - centerY) >= 244
- * - Midrange: between paint and 3pt line
+ * Court zone for a position in NBA court centimetres, relative to the nearer
+ * basket (hoop 160 cm from the baseline, paint 579 x 488, arc radius 724,
+ * corner three 91 cm from the sideline out to 424 cm).
  */
 export function getCourtZone(
   courtXY: [number, number],
   courtWidth: number,
   courtHeight: number
 ): CourtZone {
-  const halfCourt = courtWidth / 2;
-  const hoopX1 = 160; // left hoop
-  const hoopX2 = courtWidth - 160; // right hoop
-  const centerY = courtHeight / 2;
   const [x, y] = courtXY;
+  const leftHalf = x < courtWidth / 2;
+  const distFromBaseline = leftHalf ? x : courtWidth - x;
+  const dy = Math.abs(y - courtHeight / 2);
+  const distFromHoop = Math.hypot(distFromBaseline - 160, dy);
 
-  // Determine which half the player is closest to
-  const nearHoopX = x < halfCourt ? hoopX1 : hoopX2;
-  const distFromHoop = Math.sqrt((x - nearHoopX) ** 2 + (y - centerY) ** 2);
-  const distFromBaseline = x < halfCourt ? x : courtWidth - x;
+  if (distFromBaseline <= 579 && dy <= 244) return 'Paint';
 
-  // Paint: within key area
-  if (distFromBaseline < 580 && Math.abs(y - centerY) < 244) {
-    return 'Paint';
+  if (distFromBaseline <= 424) {
+    if (dy >= courtHeight / 2 - 91) return leftHalf ? 'Left Corner 3' : 'Right Corner 3';
+    return 'Midrange';
   }
 
-  // 3-point line distance ~723cm from hoop
-  if (distFromHoop > 723) {
-    if (y < 91 || y > courtHeight - 91) {
-      return x < halfCourt ? 'Left Corner 3' : 'Right Corner 3';
-    }
-    if (x < halfCourt) {
-      return 'Left Wing';
-    }
-    return 'Right Wing';
-  }
-
-  // Backcourt
-  if (distFromBaseline > halfCourt) {
-    return 'Backcourt';
-  }
-
-  // Top of Key
-  if (distFromBaseline < 580 && Math.abs(y - centerY) >= 244) {
-    return 'Top of Key';
-  }
-
-  return 'Midrange';
+  if (distFromHoop <= 724) return 'Midrange';
+  if (distFromHoop > 1000) return 'Backcourt';
+  if (dy <= 300) return 'Top of Key';
+  return leftHalf ? 'Left Wing' : 'Right Wing';
 }

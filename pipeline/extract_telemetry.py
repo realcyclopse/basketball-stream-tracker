@@ -1,106 +1,80 @@
 #!/usr/bin/env python3
 """
-extract_telemetry.py — Main CV pipeline for basketball stream telemetry extraction.
+extract_telemetry.py — CV pipeline for basketball stream telemetry extraction.
 
-Processes an input MP4 video to detect players, track them across frames,
-detect court keypoints, compute homography transforms, and project player
-positions onto a 2D court model. Outputs telemetry.json for the web viewer.
+For every clip it detects players (Roboflow basketball-player-detection-3),
+tracks them (SAM2 real-time when installed, ByteTrack otherwise), detects the
+33 court landmarks (basketball-court-detection-2), fits a per-frame homography
+and projects each player's feet onto the 2D court. Results are cleaned by
+trajectory_smoother and written next to the clip for the web viewer:
+
+    <clip dir>/telemetry.json
+    <clip dir>/roster.json               (draft, only if none exists yet)
+    <clip dir>/frame_0_calibration.jpg   (boxes labelled "ID: <id>")
+
+Usage:
+    # every clip under web/public/clips/<clip_id>/video.mp4
+    python extract_telemetry.py
+
+    # a single video
+    python extract_telemetry.py --video clip.mp4 --output-dir out/
+
+Requires ROBOFLOW_API_KEY in the environment.
 """
 
+from __future__ import annotations
+
 import argparse
-import cv2
 import json
 import logging
 import os
 import sys
 import time
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
+import supervision as sv
 from tqdm import tqdm
 
-from inference import get_model
-import supervision as sv
-
+from track_utils import (
+    COURT_HEIGHT_CM,
+    COURT_WIDTH_CM,
+    DEFAULT_MATCH_INFO,
+    CourtProjector,
+    assign_teams,
+    bbox_to_body_polygon,
+    build_draft_roster,
+    consolidate_tracks,
+    fit_court_projector,
+    jersey_color_sample,
+    load_court_vertices,
+    mask_to_polygon,
+    plausible_court_positions,
+)
 from trajectory_smoother import smooth_trajectories
-
-# ---------------------------------------------------------------------------
-# Court configuration / ViewTransformer imports (with fallback)
-# ---------------------------------------------------------------------------
-try:
-    from sports.configs.basketball import BasketballCourtConfiguration as CourtConfiguration
-    from sports.common.constants import League, MeasurementUnit
-    from sports.common.view import ViewTransformer
-
-    SPORTS_LIB_AVAILABLE = True
-except ImportError:
-    SPORTS_LIB_AVAILABLE = False
-
-    class MeasurementUnit:
-        CENTIMETERS = "centimeters"
-
-    class League:
-        NBA = "nba"
-
-    class CourtConfiguration:
-        """Minimal fallback court configuration for an NBA court (in cm)."""
-
-        def __init__(self, league=None, measurement_unit=None):
-            self.league = league
-            self.measurement_unit = measurement_unit
-            # NBA court: 94 ft × 50 ft  →  2865.12 cm × 1524.0 cm
-            self.width = 2865.12
-            self.height = 1524.0
-            # 14 canonical keypoints (corners, FT corners, 3-pt arcs, centre)
-            self.vertices = np.array(
-                [
-                    [0.0, 0.0],
-                    [0.0, 1524.0],
-                    [2865.12, 0.0],
-                    [2865.12, 1524.0],
-                    [0.0, 549.0],
-                    [0.0, 975.0],
-                    [579.12, 549.0],
-                    [579.12, 975.0],
-                    [2865.12, 549.0],
-                    [2865.12, 975.0],
-                    [2286.0, 549.0],
-                    [2286.0, 975.0],
-                    [1432.56, 0.0],
-                    [1432.56, 1524.0],
-                ],
-                dtype=np.float32,
-            )
-
-    class ViewTransformer:
-        """Fallback perspective transformer using OpenCV homography."""
-
-        def __init__(self, source: np.ndarray, target: np.ndarray):
-            if len(source) < 4 or len(target) < 4:
-                raise ValueError("Need at least 4 point correspondences for homography.")
-            self.source = np.asarray(source, dtype=np.float32)
-            self.target = np.asarray(target, dtype=np.float32)
-            self.m, _ = cv2.findHomography(self.source, self.target, cv2.RANSAC, 5.0)
-            if self.m is None:
-                raise ValueError("Homography computation failed.")
-
-        def transform_points(self, points: np.ndarray) -> np.ndarray:
-            pts = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
-            transformed = cv2.perspectiveTransform(pts, self.m)
-            return transformed.reshape(-1, 2)
-
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 PLAYER_MODEL_ID = "basketball-player-detection-3-ycjdo/4"
 KEYPOINT_MODEL_ID = "basketball-court-detection-2/14"
-PLAYER_CLASS_IDS = [3, 4, 5, 6, 7]  # player class variants only
+# player, player-in-possession, player-jump-shot, player-layup-dunk, player-shot-block
+PLAYER_CLASS_IDS = [3, 4, 5, 6, 7]
 
-HOMOGRAPHY_CACHE_TTL = 10  # max frames to reuse a stale ViewTransformer
+PLAYER_CONFIDENCE = 0.4
+PLAYER_IOU = 0.9
+KEYPOINT_CONFIDENCE = 0.3        # model threshold
+KEYPOINT_ANCHOR_CONFIDENCE = 0.5 # landmarks trusted for the homography
+HOMOGRAPHY_CACHE_TTL = 10        # frames a stale homography may be reused
+COLOR_SAMPLE_EVERY = 5           # frames between jersey colour samples
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+SAM2_CHECKPOINT = "checkpoints/sam2.1_hiera_large.pt"
+
+DEFAULT_CLIPS_DIR = Path(__file__).resolve().parent.parent / "web" / "public" / "clips"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -110,375 +84,344 @@ log = logging.getLogger("extract_telemetry")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Models
 # ---------------------------------------------------------------------------
 
-def _bbox_polygon(xyxy: np.ndarray) -> list[list[float]]:
-    """Return a simple 4-point polygon (list of [x, y]) from a bounding box."""
-    x1, y1, x2, y2 = map(float, xyxy)
-    return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+class RoboflowPlayerDetector:
+    """Player boxes from basketball-player-detection-3 (referees, ball, rim dropped)."""
+
+    def __init__(self, confidence: float = PLAYER_CONFIDENCE, iou: float = PLAYER_IOU):
+        from inference import get_model
+
+        self.model = get_model(model_id=PLAYER_MODEL_ID)
+        self.confidence = confidence
+        self.iou = iou
+
+    def detect(self, frame: np.ndarray) -> sv.Detections:
+        result = self.model.infer(frame, confidence=self.confidence, iou_threshold=self.iou)[0]
+        detections = sv.Detections.from_inference(result)
+        detections = detections[np.isin(detections.class_id, PLAYER_CLASS_IDS)]
+        # one player can be reported under two action classes
+        return detections.with_nms(threshold=0.6, class_agnostic=True)
 
 
-def _mask_to_polygon(mask: np.ndarray, epsilon_ratio: float = 0.015,
-                     min_vertices: int = 15, max_vertices: int = 25) -> list[list[float]] | None:
-    """Extract the largest contour from a binary mask and simplify it."""
-    contours, _ = cv2.findContours(
-        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    if not contours:
-        return None
+class RoboflowCourtDetector:
+    """The 33 court landmarks from basketball-court-detection-2."""
 
-    # Largest connected component by area
-    contour = max(contours, key=cv2.contourArea)
-    arc_len = cv2.arcLength(contour, closed=True)
-    if arc_len == 0:
-        return None
+    def __init__(self, confidence: float = KEYPOINT_CONFIDENCE):
+        from inference import get_model
 
-    epsilon = epsilon_ratio * arc_len
-    approx = cv2.approxPolyDP(contour, epsilon, closed=True)
+        self.model = get_model(model_id=KEYPOINT_MODEL_ID)
+        self.confidence = confidence
 
-    # Iteratively adjust epsilon to land within vertex budget
-    for _ in range(10):
-        n = len(approx)
-        if min_vertices <= n <= max_vertices:
-            break
-        if n > max_vertices:
-            epsilon *= 1.3
-        else:
-            epsilon *= 0.7
-        approx = cv2.approxPolyDP(contour, epsilon, closed=True)
-
-    return approx.reshape(-1, 2).tolist()
+    def detect(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Returns (xy (K, 2), confidence (K,)); both empty when no court is found."""
+        result = self.model.infer(frame, confidence=self.confidence)[0]
+        key_points = sv.KeyPoints.from_inference(result)
+        if key_points.xy is None or len(key_points.xy) == 0 or key_points.confidence is None:
+            return np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32)
+        best = int(np.argmax(key_points.confidence.mean(axis=1)))
+        return key_points.xy[best], key_points.confidence[best]
 
 
-def _filter_keypoints(result, confidence_threshold: float = 0.5):
+# ---------------------------------------------------------------------------
+# Trackers
+# ---------------------------------------------------------------------------
+
+class ByteTrackTracker:
+    """Box tracker. Ids fragment on occlusion; consolidate_tracks stitches them."""
+
+    name = "bytetrack"
+    has_masks = False
+
+    def __init__(self, fps: float):
+        self.tracker = sv.ByteTrack(
+            track_activation_threshold=0.3,
+            lost_track_buffer=int(round(fps)) or 30,
+            minimum_matching_threshold=0.8,
+            frame_rate=int(round(fps)) or 30,
+            minimum_consecutive_frames=1,
+        )
+
+    def update(self, frame: np.ndarray, detections: sv.Detections) -> sv.Detections:
+        return self.tracker.update_with_detections(detections)
+
+
+class Sam2Tracker:
     """
-    Parse keypoint detection result and return matched (source, target) arrays.
+    SAM2 real-time (github.com/Gy920/segment-anything-2-real-time) mask tracker.
 
-    Returns (frame_landmarks, court_landmarks) — both np.float32 arrays of shape (N, 2).
+    Players are prompted with their detection boxes on the first frame that has
+    detections and then propagated; players entering later are not tracked.
     """
+
+    name = "sam2"
+    has_masks = True
+
+    def __init__(self, predictor: Any):
+        self.predictor = predictor
+        self.prompted = False
+
+    def _autocast(self):
+        import torch
+
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+
+    def update(self, frame: np.ndarray, detections: sv.Detections) -> sv.Detections:
+        import torch
+
+        if not self.prompted:
+            if len(detections) == 0:
+                return sv.Detections.empty()
+            order = np.argsort(detections.xyxy[:, 0])
+            with torch.inference_mode(), self._autocast():
+                self.predictor.load_first_frame(frame)
+                for obj_id, xyxy in enumerate(detections.xyxy[order], start=1):
+                    self.predictor.add_new_prompt(
+                        frame_idx=0,
+                        obj_id=obj_id,
+                        bbox=np.asarray([xyxy], dtype=np.float32),
+                    )
+            self.prompted = True
+
+        with torch.inference_mode(), self._autocast():
+            tracker_ids, mask_logits = self.predictor.track(frame)
+
+        tracker_ids = np.asarray(tracker_ids, dtype=int)
+        masks = (mask_logits > 0.0).cpu().numpy()
+        masks = np.squeeze(masks, axis=1).astype(bool) if masks.ndim == 4 else masks.astype(bool)
+        # drop stray blobs far from the main body
+        masks = np.array([
+            sv.filter_segments_by_distance(mask, relative_distance=0.03, mode="edge")
+            for mask in masks
+        ]).reshape(-1, frame.shape[0], frame.shape[1])
+
+        visible = masks.reshape(len(masks), -1).any(axis=1)
+        if not visible.any():
+            return sv.Detections.empty()
+        masks, tracker_ids = masks[visible], tracker_ids[visible]
+        return sv.Detections(xyxy=sv.mask_to_xyxy(masks=masks), mask=masks, tracker_id=tracker_ids)
+
+
+def load_sam2_predictor(config: str, checkpoint: str) -> Optional[Any]:
+    """SAM2 camera predictor, or None when SAM2 / CUDA / the checkpoint is missing."""
     try:
-        # Roboflow keypoint model result structure
-        keypoints = result[0].keypoints  # type: ignore[union-attr]
-        xy = keypoints.xy.cpu().numpy() if hasattr(keypoints.xy, "cpu") else np.array(keypoints.xy)
-        conf = keypoints.confidence.cpu().numpy() if hasattr(keypoints.confidence, "cpu") else np.array(keypoints.confidence)
-    except (AttributeError, IndexError, TypeError):
-        # Alternate: result may already expose .keypoints as a list of dicts
-        try:
-            preds = result.json() if hasattr(result, "json") else result
-            if isinstance(preds, dict):
-                preds = preds.get("predictions", [])
-            frame_pts, court_pts = [], []
-            for pred in preds:
-                kps = pred.get("keypoints", [])
-                for kp in kps:
-                    if kp.get("confidence", 0) >= confidence_threshold:
-                        idx = kp.get("class_id", kp.get("index", None))
-                        if idx is not None:
-                            frame_pts.append([kp["x"], kp["y"]])
-                            # Map to court vertex by index
-                            court_pts.append(idx)
-            return (
-                np.array(frame_pts, dtype=np.float32),
-                np.array(court_pts, dtype=np.float32) if court_pts else np.empty((0, 2), dtype=np.float32),
-                True,  # flag: indices mode
-            )
-        except Exception:
-            return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32), False
-
-    # xy shape: (1, K, 2), conf shape: (1, K)
-    if xy.ndim == 3:
-        xy = xy[0]
-    if conf.ndim == 2:
-        conf = conf[0]
-
-    valid = conf >= confidence_threshold
-    frame_landmarks = xy[valid].astype(np.float32)
-    valid_indices = np.where(valid)[0]
-
-    return frame_landmarks, valid_indices, False
+        import torch
+        from sam2.build_sam import build_sam2_camera_predictor
+    except ImportError as exc:
+        log.info("SAM2 not importable (%s)", exc)
+        return None
+    if not torch.cuda.is_available():
+        log.info("SAM2 needs a CUDA GPU")
+        return None
+    if not os.path.isfile(checkpoint):
+        log.info("SAM2 checkpoint not found: %s", checkpoint)
+        return None
+    return build_sam2_camera_predictor(config, checkpoint)
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Per-clip processing
 # ---------------------------------------------------------------------------
 
-def run_pipeline(
+def _draw_calibration_frame(frame: np.ndarray, players: List[Dict[str, Any]]) -> np.ndarray:
+    image = frame.copy()
+    for player in players:
+        x1, y1, x2, y2 = (int(round(v)) for v in player["bbox"])
+        label = f"ID: {player['id']}"
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.rectangle(image, (x1, y1 - th - 10), (x1 + tw + 8, y1), (0, 255, 255), -1)
+        cv2.putText(image, label, (x1 + 4, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+    return image
+
+
+def process_video(
     video_path: str,
     output_dir: str,
-    tracker_type: str = "bytetrack",
-    confidence: float = 0.35,
-) -> None:
-    """Run the full telemetry extraction pipeline."""
-
-    # ---- Video capture ----
-    if not os.path.isfile(video_path):
-        log.error("Video file not found: %s", video_path)
-        sys.exit(1)
+    player_detector: Any,
+    court_detector: Any,
+    tracker_factory: Callable[[float], Any],
+    match_info: Optional[Dict[str, Any]] = None,
+    overwrite_roster: bool = False,
+    min_track_frames: int = 15,
+    show_progress: bool = True,
+) -> Dict[str, Any]:
+    """Run the pipeline on one video and write its telemetry. Returns the telemetry dict."""
+    match_info = match_info or DEFAULT_MATCH_INFO
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        log.error("Failed to open video: %s", video_path)
-        sys.exit(1)
+        raise RuntimeError(f"Failed to open video: {video_path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    expected_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    log.info("%s — %dx%d @ %.2f fps, %d frames", video_path, width, height, fps, expected_frames)
 
-    log.info(
-        "Video opened — %d×%d @ %.2f fps, %d frames (%.1f s)",
-        width, height, fps, total_frames, total_frames / fps if fps else 0,
-    )
+    tracker = tracker_factory(fps)
+    court_vertices = load_court_vertices()
 
-    # ---- Models ----
-    log.info("Loading player detection model: %s", PLAYER_MODEL_ID)
-    player_model = get_model(PLAYER_MODEL_ID)
+    cached_projector: Optional[CourtProjector] = None
+    cache_age = 0
+    valid_homographies = 0
 
-    log.info("Loading keypoint detection model: %s", KEYPOINT_MODEL_ID)
-    keypoint_model = get_model(KEYPOINT_MODEL_ID)
-
-    # ---- Tracker ----
-    sam2_tracker = None
-    byte_tracker = None
-
-    if tracker_type == "sam2":
-        log.info("Initializing SAM2 tracker")
-        try:
-            from sam2.tracker import SAM2Tracker  # type: ignore[import-untyped]
-            sam2_tracker = SAM2Tracker()
-        except ImportError:
-            log.warning("SAM2 not available — falling back to ByteTrack")
-            tracker_type = "bytetrack"
-
-    if tracker_type == "bytetrack":
-        log.info("Initializing ByteTrack tracker")
-        byte_tracker = sv.ByteTrack(
-            track_activation_threshold=confidence,
-            minimum_matching_threshold=0.8,
-            frame_rate=int(fps) if fps else 30,
-        )
-
-    # ---- Court configuration ----
-    court_config = CourtConfiguration(
-        league=League.NBA,
-        measurement_unit=MeasurementUnit.CENTIMETERS,
-    )
-    court_vertices = (
-        court_config.vertices
-        if hasattr(court_config, "vertices")
-        else np.zeros((14, 2), dtype=np.float32)
-    )
-
-    # ---- Annotators for calibration frame ----
-    box_annotator = sv.BoxAnnotator(thickness=2)
-    label_annotator = sv.LabelAnnotator(text_position=sv.Position.TOP_LEFT)
-
-    # ---- Homography cache ----
-    cached_transformer: ViewTransformer | None = None
-    cache_age: int = 0  # how many frames since last valid homography
-
-    # ---- Output accumulators ----
-    frames_data: list[dict] = []
-    os.makedirs(output_dir, exist_ok=True)
-
+    frames_data: List[Dict[str, Any]] = []
+    color_samples: Dict[int, List[np.ndarray]] = {}
+    first_frame: Optional[np.ndarray] = None
     t_start = time.time()
 
-    # ---- Per-frame loop ----
-    with tqdm(total=total_frames, desc="Extracting telemetry", unit="frame") as pbar:
-        frame_idx = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+    progress = tqdm(total=expected_frames, desc=Path(video_path).parent.name or "clip",
+                    unit="frame", disable=not show_progress)
+    frame_idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if first_frame is None:
+            first_frame = frame.copy()
 
-            # ------ (b) Player detection ------
-            try:
-                det_result = player_model.infer(frame, confidence=confidence)
-                detections = sv.Detections.from_inference(det_result)
-            except Exception as exc:
-                log.warning("Player detection failed on frame %d: %s", frame_idx, exc)
-                detections = sv.Detections.empty()
+        # Players + tracking
+        try:
+            detections = tracker.update(frame, player_detector.detect(frame))
+        except Exception as exc:
+            log.warning("Detection/tracking failed on frame %d: %s", frame_idx, exc)
+            detections = sv.Detections.empty()
+        if detections.tracker_id is None:
+            detections = sv.Detections.empty()
 
-            # Filter to player class IDs only
-            if len(detections) > 0:
-                mask = np.isin(detections.class_id, PLAYER_CLASS_IDS)
-                detections = detections[mask]
-
-            # ------ (c) Tracking ------
-            if tracker_type == "bytetrack" and byte_tracker is not None:
-                detections = byte_tracker.update_with_detections(detections)
-            elif tracker_type == "sam2" and sam2_tracker is not None:
-                try:
-                    detections = sam2_tracker.update(frame, detections)
-                except Exception as exc:
-                    log.warning("SAM2 tracking failed on frame %d: %s", frame_idx, exc)
-
-            # ------ (d) Calibration snapshot on frame 0 ------
-            if frame_idx == 0:
-                try:
-                    labels = [
-                        f"#{int(tid)}"
-                        for tid in (detections.tracker_id if detections.tracker_id is not None else [])
-                    ]
-                    calib_frame = frame.copy()
-                    calib_frame = box_annotator.annotate(scene=calib_frame, detections=detections)
-                    if labels:
-                        calib_frame = label_annotator.annotate(
-                            scene=calib_frame, detections=detections, labels=labels
-                        )
-                    calib_path = os.path.join(output_dir, "frame_0_calibration.jpg")
-                    cv2.imwrite(calib_path, calib_frame)
-                    log.info("Saved calibration frame → %s", calib_path)
-                except Exception as exc:
-                    log.warning("Could not save calibration frame: %s", exc)
-
-            # ------ (e) Keypoint detection ------
-            homography_valid = False
-            transformer = cached_transformer
-
-            try:
-                kp_result = keypoint_model.infer(frame)
-                frame_landmarks, indices_or_court, is_index_mode = _filter_keypoints(
-                    kp_result, confidence_threshold=0.5
+        # Court landmarks -> homography
+        projector: Optional[CourtProjector] = None
+        try:
+            landmarks_xy, landmarks_conf = court_detector.detect(frame)
+            anchors = np.asarray(landmarks_conf) > KEYPOINT_ANCHOR_CONFIDENCE
+            if len(anchors) == len(court_vertices) and np.count_nonzero(anchors) >= 4:
+                projector = fit_court_projector(
+                    np.asarray(landmarks_xy)[anchors], court_vertices[anchors]
                 )
-            except Exception as exc:
-                log.warning("Keypoint detection failed on frame %d: %s", frame_idx, exc)
-                frame_landmarks = np.empty((0, 2), dtype=np.float32)
-                indices_or_court = np.empty((0, 2), dtype=np.float32)
-                is_index_mode = False
+        except Exception as exc:
+            log.warning("Court detection failed on frame %d: %s", frame_idx, exc)
 
-            # ------ (f) Homography / ViewTransformer ------
-            num_kp = len(frame_landmarks)
-            if num_kp >= 4:
-                try:
-                    if is_index_mode:
-                        court_pts = court_vertices[indices_or_court.astype(int)]
-                    else:
-                        court_pts = indices_or_court
+        feet_xy = (
+            detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+            if len(detections) > 0 else np.empty((0, 2), dtype=np.float32)
+        )
 
-                    if len(court_pts) >= 4 and len(frame_landmarks) >= 4:
-                        transformer = ViewTransformer(
-                            source=frame_landmarks[:len(court_pts)],
-                            target=court_pts[:len(frame_landmarks)],
-                        )
-                        cached_transformer = transformer
-                        cache_age = 0
-                        homography_valid = True
-                except Exception as exc:
-                    log.debug("ViewTransformer construction failed on frame %d: %s", frame_idx, exc)
+        # A homography that throws most players off the court is a bad fit.
+        if projector is not None and len(feet_xy) > 0:
+            if plausible_court_positions(projector.transform_points(feet_xy)).mean() < 0.5:
+                projector = None
 
-            if not homography_valid:
-                cache_age += 1
-                if cache_age > HOMOGRAPHY_CACHE_TTL:
-                    transformer = None
-                elif cached_transformer is not None:
-                    transformer = cached_transformer
+        homography_valid = projector is not None
+        if homography_valid:
+            cached_projector, cache_age = projector, 0
+            valid_homographies += 1
+        else:
+            cache_age += 1
+            projector = cached_projector if cache_age <= HOMOGRAPHY_CACHE_TTL else None
 
-            # ------ (g) Feet positions (video coords) ------
-            if len(detections) > 0:
-                feet_video_xy = detections.get_anchors_coordinates(
-                    anchor=sv.Position.BOTTOM_CENTER
-                )
-            else:
-                feet_video_xy = np.empty((0, 2), dtype=np.float32)
+        court_xy = projector.transform_points(feet_xy) if projector is not None else None
+        on_court = plausible_court_positions(court_xy) if court_xy is not None else None
 
-            # ------ (h) Project to court coordinates ------
-            if transformer is not None and len(feet_video_xy) > 0:
-                try:
-                    feet_court_xy = transformer.transform_points(feet_video_xy)
-                except Exception:
-                    feet_court_xy = np.full_like(feet_video_xy, np.nan)
-            else:
-                feet_court_xy = np.full_like(feet_video_xy, np.nan)
+        players = []
+        for i in range(len(detections)):
+            tracker_id = int(detections.tracker_id[i])
+            xyxy = detections.xyxy[i]
+            mask = detections.mask[i] if detections.mask is not None else None
 
-            # ------ (i) Silhouettes / polygons ------
-            polygons: list[list[list[float]] | None] = []
-            if tracker_type == "sam2" and detections.mask is not None:
-                for mask_single in detections.mask:
-                    poly = _mask_to_polygon(mask_single)
-                    polygons.append(poly)
-            else:
-                # ByteTrack — generate 4-point bbox polygons
-                for xyxy in detections.xyxy:
-                    polygons.append(_bbox_polygon(xyxy))
+            polygon = mask_to_polygon(mask) if mask is not None else None
+            if polygon is None:
+                polygon = bbox_to_body_polygon(xyxy)
 
-            # ------ (j) Build frame data dict ------
-            players: list[dict] = []
-            tracker_ids = (
-                detections.tracker_id.tolist()
-                if detections.tracker_id is not None
-                else list(range(len(detections)))
-            )
+            if frame_idx % COLOR_SAMPLE_EVERY == 0:
+                sample = jersey_color_sample(frame, xyxy, mask)
+                if sample is not None:
+                    color_samples.setdefault(tracker_id, []).append(sample)
 
-            for i in range(len(detections)):
-                tid = int(tracker_ids[i]) if i < len(tracker_ids) else i
-                bbox = detections.xyxy[i].tolist()
+            position = None
+            if court_xy is not None and on_court[i]:
+                position = [round(float(court_xy[i][0]), 1), round(float(court_xy[i][1]), 1)]
 
-                court_x = float(feet_court_xy[i][0]) if i < len(feet_court_xy) and not np.isnan(feet_court_xy[i][0]) else None
-                court_y = float(feet_court_xy[i][1]) if i < len(feet_court_xy) and not np.isnan(feet_court_xy[i][1]) else None
+            players.append({
+                "id": tracker_id,
+                "bbox": [round(float(v), 1) for v in xyxy],
+                "feet_video_xy": [round(float(feet_xy[i][0]), 1), round(float(feet_xy[i][1]), 1)],
+                "polygon": polygon,
+                "court_xy": position,
+                "speed_kmh": 0.0,
+                "is_interpolated": False,
+            })
 
-                player_dict: dict = {
-                    "id": tid,
-                    "bbox": [round(float(v), 1) for v in bbox],
-                    "feet_video_xy": [round(float(feet_video_xy[i][0]), 1), round(float(feet_video_xy[i][1]), 1)] if i < len(feet_video_xy) else [0.0, 0.0],
-                    "polygon": polygons[i] if i < len(polygons) else [],
-                    "court_xy": [round(court_x, 1), round(court_y, 1)] if court_x is not None and court_y is not None else [0.0, 0.0],
-                    "speed_kmh": 0.0,
-                    "is_interpolated": False,
-                }
-                players.append(player_dict)
+        frames_data.append({
+            "frame_idx": frame_idx,
+            "timestamp": round(frame_idx / fps, 4),
+            "homography_valid": homography_valid,
+            "players": players,
+        })
+        frame_idx += 1
+        progress.update(1)
 
-            frame_data = {
-                "frame_idx": frame_idx,
-                "timestamp": round(frame_idx / fps, 4) if fps else 0.0,
-                "homography_valid": homography_valid or (cached_transformer is not None and cache_age <= HOMOGRAPHY_CACHE_TTL),
-                "players": players,
-            }
-            frames_data.append(frame_data)
-
-            frame_idx += 1
-            pbar.update(1)
-
+    progress.close()
     cap.release()
+    if frame_idx == 0:
+        raise RuntimeError(f"No frames decoded from {video_path}")
+
     elapsed = time.time() - t_start
-    log.info(
-        "Frame extraction complete — %d frames in %.1f s (%.1f fps)",
-        frame_idx, elapsed, frame_idx / elapsed if elapsed else 0,
+    log.info("Processed %d frames in %.1f s (%.1f fps); homography valid on %d",
+             frame_idx, elapsed, frame_idx / max(elapsed, 1e-6), valid_homographies)
+    if valid_homographies == 0:
+        log.warning("No valid homography in this clip — court positions will be empty")
+
+    # Track clean-up: stitch fragments (box trackers only), drop blips, renumber 1..N
+    id_map = consolidate_tracks(
+        frames_data,
+        min_track_frames=min_track_frames,
+        stitch=not getattr(tracker, "has_masks", False),
     )
+    player_ids = sorted(set(id_map.values()))
+    log.info("%d player tracks kept", len(player_ids))
 
-    court_w = float(court_vertices[:, 0].max()) if len(court_vertices) else 2865.0
-    court_h = float(court_vertices[:, 1].max()) if len(court_vertices) else 1524.0
-
-    metadata_dict = {
+    metadata = {
         "video_width": width,
         "video_height": height,
-        "fps": round(fps, 2),
+        "fps": round(fps, 3),
         "total_frames": frame_idx,
-        "court_width": int(round(court_w)),
-        "court_height": int(round(court_h)),
+        "court_width": int(COURT_WIDTH_CM),
+        "court_height": int(COURT_HEIGHT_CM),
         "court_unit": "cm",
+        "source": "pipeline",
+        "tracker": getattr(tracker, "name", "unknown"),
     }
+    frames_data = smooth_trajectories(frames_data, metadata=metadata)
+    telemetry = {"metadata": metadata, "frames": frames_data}
 
-    # ---- Post-processing: smooth trajectories ----
-    log.info("Smoothing trajectories …")
-    try:
-        frames_data = smooth_trajectories(frames_data, metadata=metadata_dict)
-    except Exception as exc:
-        log.warning("Trajectory smoothing failed: %s — writing raw data", exc)
-
-    # ---- Write output ----
-    telemetry = {
-        "metadata": metadata_dict,
-        "frames": frames_data,
-    }
-
-    out_path = os.path.join(output_dir, "telemetry.json")
-    with open(out_path, "w", encoding="utf-8") as fp:
+    os.makedirs(output_dir, exist_ok=True)
+    telemetry_path = os.path.join(output_dir, "telemetry.json")
+    with open(telemetry_path, "w", encoding="utf-8") as fp:
         json.dump(telemetry, fp, separators=(",", ":"))
+    log.info("Wrote %s (%.2f MB)", telemetry_path, os.path.getsize(telemetry_path) / 1e6)
 
-    size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    log.info("Wrote %s (%.2f MB, %d frames)", out_path, size_mb, frame_idx)
+    if first_frame is not None:
+        calibration_path = os.path.join(output_dir, "frame_0_calibration.jpg")
+        cv2.imwrite(calibration_path, _draw_calibration_frame(first_frame, frames_data[0]["players"]))
+        log.info("Wrote %s", calibration_path)
+
+    roster_path = os.path.join(output_dir, "roster.json")
+    if overwrite_roster or not os.path.isfile(roster_path):
+        colors: Dict[int, np.ndarray] = {}
+        for raw_id, samples in color_samples.items():
+            if raw_id in id_map:
+                colors.setdefault(id_map[raw_id], []).extend(samples)  # type: ignore[arg-type]
+        colors = {pid: np.median(np.stack(samples), axis=0) for pid, samples in colors.items()}
+        roster = build_draft_roster(player_ids, assign_teams(colors, match_info), match_info)
+        with open(roster_path, "w", encoding="utf-8") as fp:
+            json.dump(roster, fp, indent=2)
+        log.info("Wrote draft %s — edit names / numbers / teams by hand", roster_path)
+    else:
+        log.info("Kept existing %s (use --overwrite-roster to regenerate)", roster_path)
+
+    return telemetry
 
 
 # ---------------------------------------------------------------------------
@@ -486,42 +429,89 @@ def run_pipeline(
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Extract basketball telemetry from broadcast video.",
-    )
-    parser.add_argument(
-        "--video",
-        type=str,
-        required=True,
-        help="Path to input MP4 file.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=os.path.join(os.path.dirname(__file__), "..", "web", "public"),
-        help="Output directory for telemetry.json (default: ../web/public).",
-    )
-    parser.add_argument(
-        "--tracker",
-        type=str,
-        choices=["sam2", "bytetrack"],
-        default="bytetrack",
-        help="Tracking algorithm (default: bytetrack).",
-    )
-    parser.add_argument(
-        "--confidence",
-        type=float,
-        default=0.35,
-        help="Detection confidence threshold (default: 0.35).",
-    )
+    parser = argparse.ArgumentParser(description="Extract basketball telemetry from broadcast clips.")
+    parser.add_argument("--video", action="append", default=[],
+                        help="Input video. Repeatable. Omit to process every clip in --clips-dir.")
+    parser.add_argument("--clips-dir", type=Path, default=DEFAULT_CLIPS_DIR,
+                        help="Directory of <clip_id>/video.mp4 folders (default: web/public/clips).")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Where to write outputs for --video (default: next to the video).")
+    parser.add_argument("--tracker", choices=["auto", "sam2", "bytetrack"], default="auto",
+                        help="auto = SAM2 when installed, otherwise ByteTrack.")
+    parser.add_argument("--confidence", type=float, default=PLAYER_CONFIDENCE,
+                        help="Player detection confidence threshold.")
+    parser.add_argument("--sam2-config", default=os.environ.get("SAM2_CONFIG", SAM2_CONFIG))
+    parser.add_argument("--sam2-checkpoint", default=os.environ.get("SAM2_CHECKPOINT", SAM2_CHECKPOINT))
+    parser.add_argument("--match-info", type=Path, default=None,
+                        help="JSON file with home_team / away_team for the draft roster.")
+    parser.add_argument("--overwrite-roster", action="store_true",
+                        help="Regenerate roster.json even if one exists.")
+    parser.add_argument("--min-track-frames", type=int, default=15,
+                        help="Tracks seen in fewer frames are discarded.")
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main() -> int:
     args = parse_args()
-    run_pipeline(
-        video_path=args.video,
-        output_dir=args.output_dir,
-        tracker_type=args.tracker,
-        confidence=args.confidence,
-    )
+
+    if args.video:
+        jobs = []
+        for video in args.video:
+            video_path = Path(video)
+            if args.output_dir is None:
+                out = video_path.parent
+            elif len(args.video) > 1:
+                out = args.output_dir / video_path.stem
+            else:
+                out = args.output_dir
+            jobs.append((video_path, out))
+    else:
+        jobs = [(p, p.parent) for p in sorted(args.clips_dir.glob("*/video.mp4"))]
+        if not jobs:
+            log.error("No clips found under %s", args.clips_dir)
+            return 1
+
+    missing = [str(v) for v, _ in jobs if not v.is_file()]
+    if missing:
+        log.error("Video not found: %s", ", ".join(missing))
+        return 1
+    if not os.environ.get("ROBOFLOW_API_KEY"):
+        log.error("ROBOFLOW_API_KEY is not set")
+        return 1
+
+    match_info = DEFAULT_MATCH_INFO
+    if args.match_info is not None:
+        match_info = json.loads(args.match_info.read_text(encoding="utf-8"))
+
+    log.info("Loading Roboflow models")
+    player_detector = RoboflowPlayerDetector(confidence=args.confidence)
+    court_detector = RoboflowCourtDetector()
+
+    predictor = None
+    if args.tracker in ("auto", "sam2"):
+        predictor = load_sam2_predictor(args.sam2_config, args.sam2_checkpoint)
+        if predictor is None and args.tracker == "sam2":
+            log.error("--tracker sam2 requested but SAM2 is unavailable")
+            return 1
+    log.info("Tracker: %s", "SAM2" if predictor is not None else "ByteTrack")
+
+    def tracker_factory(fps: float) -> Any:
+        return Sam2Tracker(predictor) if predictor is not None else ByteTrackTracker(fps)
+
+    failures = 0
+    for video_path, out in jobs:
+        try:
+            process_video(
+                str(video_path), str(out), player_detector, court_detector, tracker_factory,
+                match_info=match_info,
+                overwrite_roster=args.overwrite_roster,
+                min_track_frames=args.min_track_frames,
+            )
+        except Exception:
+            log.exception("Failed on %s", video_path)
+            failures += 1
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

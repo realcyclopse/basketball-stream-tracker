@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-const URL = 'http://localhost:5173';
+const URL = 'http://localhost:5173/?clip=synthetic';
 const SCREENSHOT_DIR = path.resolve('C:/Users/rishu/Desktop/d11/basketball-stream-tracker/test_screenshots');
 
 if (!fs.existsSync(SCREENSHOT_DIR)) {

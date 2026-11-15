@@ -13,7 +13,8 @@ An interactive web application for real-time basketball player tracking with bro
 - **Live Stats HUD** — Real-time speed, cumulative distance, court zone classification, and tracking status
 - **Three Highlight Modes** — Toggle between Floor Ring, Neon Outline, and HUD Brackets visualization styles
 - **Occlusion Handling** — Dashed indicators for predicted/interpolated player positions during occlusions
-- **Zero-Dependency Playback** — Works immediately with generated mock telemetry, no GPU required for the web app
+- **Three Demo Clips** — Clip picker with per-clip footage, telemetry and roster; tracking is precomputed, so the site is fully static
+- **Synthetic Demo** — A mock-telemetry clip works with no video and no GPU
 
 ## 🏗️ Architecture
 
@@ -29,36 +30,45 @@ An interactive web application for real-time basketball player tracking with bro
 │                              │     │                              │
 │  Output: telemetry.json      │     │  Input: telemetry.json       │
 │          roster.json         │     │         roster.json           │
-│          calibration.jpg     │     │         demo_clip.mp4         │
+│          calibration.jpg     │     │         video.mp4             │
 └─────────────────────────────┘     └─────────────────────────────┘
 ```
 
 ## 🚀 Quick Start
 
-### 1. Generate Mock Data (Instant — No GPU needed)
-```bash
-cd pipeline
-python generate_mock_telemetry.py
-```
-
-### 2. Install & Run Web App
+### 1. Run the web app
 ```bash
 cd web
 npm install
 npm run dev
 ```
 
-Open http://localhost:5173 — the app runs with synthetic visualization even without a video file.
+Open http://localhost:5173 and pick a clip in the header. The three broadcast clips play
+immediately; their tracking overlay appears once the pipeline has produced a
+`telemetry.json` for them. The `Synthetic` clip always works (mock data).
 
-### 3. (Optional) Process Real Broadcast Video
+### 2. Generate tracking data for the clips
 
-See [Pipeline Colab Guide](pipeline/README_COLAB.md) for detailed instructions.
+The pipeline needs a GPU and a Roboflow API key. Follow the
+[Colab guide](pipeline/README_COLAB.md) (notebook: `pipeline/colab_pipeline.ipynb`),
+then unzip its output into `web/public/clips/`.
+
+### 3. Deploy
 
 ```bash
-cd pipeline
-pip install -r requirements.txt
-python extract_telemetry.py --video path/to/broadcast.mp4 --tracker bytetrack
-# Copy generated files to web/public/
+cd web
+npm run build      # static site in web/dist, hostable at any path
+```
+
+Check you have the rights to publish the footage in `web/public/clips/` before deploying publicly.
+
+### Checks
+
+```bash
+python pipeline/test_pipeline.py                     # pipeline, offline (stub detectors)
+cd web && npm run build && npx vite preview --port 5173
+node verify_dom.js                                   # UI suite on the synthetic clip
+node verify_clips.js                                 # every demo clip loads, plays, syncs
 ```
 
 ## 📁 Project Structure
@@ -67,14 +77,17 @@ python extract_telemetry.py --video path/to/broadcast.mp4 --tracker bytetrack
 basketball-stream-tracker/
 ├── pipeline/
 │   ├── requirements.txt             # Python CV dependencies
-│   ├── extract_telemetry.py         # Main CV pipeline (RF-DETR + tracking + homography)
-│   ├── trajectory_smoother.py       # MAD outlier rejection + interpolation + smoothing
-│   ├── generate_mock_telemetry.py   # Mock data generator for instant UI testing
-│   └── README_COLAB.md              # Google Colab step-by-step guide
+│   ├── extract_telemetry.py         # Detection + tracking + homography, per clip
+│   ├── track_utils.py               # Court geometry, track clean-up, team clustering
+│   ├── trajectory_smoother.py       # Jump rejection + interpolation + smoothing
+│   ├── test_pipeline.py             # Offline end-to-end test with stub detectors
+│   ├── generate_mock_telemetry.py   # Mock data for the synthetic clip
+│   ├── colab_pipeline.ipynb         # Colab notebook
+│   └── README_COLAB.md              # Pipeline guide
 ├── web/
-│   ├── public/
-│   │   ├── telemetry.json           # Frame-by-frame tracking data
-│   │   └── roster.json              # Player metadata mapping
+│   ├── public/clips/
+│   │   ├── clips.json               # Clip manifest
+│   │   └── <clip_id>/               # video.mp4, telemetry.json, roster.json
 │   ├── src/
 │   │   ├── types/telemetry.ts       # TypeScript interfaces
 │   │   ├── components/
@@ -84,8 +97,9 @@ basketball-stream-tracker/
 │   │   │   └── PlayerStatsBar.tsx   # Live stats HUD
 │   │   ├── hooks/useVideoSync.ts    # Frame synchronization hook
 │   │   ├── utils/canvasDraw.ts      # Canvas drawing utilities
-│   │   ├── App.tsx                  # Main application layout
+│   │   ├── App.tsx                  # Clip loading + layout
 │   │   └── main.tsx                 # Entry point
+│   ├── verify_dom.js / verify_clips.js
 │   ├── package.json
 │   ├── vite.config.ts
 │   └── tailwind.config.js
@@ -108,10 +122,10 @@ basketball-stream-tracker/
 ## 📐 Data Contracts
 
 ### telemetry.json
-Frame-indexed player states with bounding boxes, polygons, court coordinates, and speed.
+Frame-indexed player states with bounding boxes, polygons, court coordinates (cm, `null` when no court mapping exists for that frame), and speed.
 
 ### roster.json  
-Maps tracker IDs to player metadata (name, number, team, position).
+Maps tracker IDs to player metadata (name, number, team, position). The pipeline writes a draft (`"draft": true`) to be edited by hand.
 
 ## 📄 License
 

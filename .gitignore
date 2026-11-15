@@ -51,7 +51,7 @@ htmlcov/
 *.mov
 *.avi
 *.mkv
-!web/public/demo_clip.mp4
+!web/public/clips/*/video.mp4
 
 # Editor / OS
 .vscode/

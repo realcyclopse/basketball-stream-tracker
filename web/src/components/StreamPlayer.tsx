@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { Play, Pause, Repeat, ChevronLeft, ChevronRight, Video, Tv } from 'lucide-react';
+import { Play, Pause, Repeat, ChevronLeft, ChevronRight, Info } from 'lucide-react';
 import { TelemetryData, RosterData, HighlightMode, PlayerFrame } from '../types/telemetry';
 import { useVideoSync } from '../hooks/useVideoSync';
 import {
@@ -14,6 +14,10 @@ import {
 interface StreamPlayerProps {
   telemetry: TelemetryData;
   roster: RosterData;
+  /** URL of the clip footage; null renders the synthetic court instead */
+  videoSrc: string | null;
+  /** shown over the picture, e.g. when a clip has no tracking data yet */
+  notice?: string | null;
   selectedPlayerId: number | null;
   onSelectPlayer: (id: number | null) => void;
   highlightMode: HighlightMode;
@@ -21,9 +25,19 @@ interface StreamPlayerProps {
   onFrameUpdate: (frame: number) => void;
 }
 
+// Camera model of pipeline/generate_mock_telemetry.py (court cm -> 1920x1080 px),
+// so the synthetic court lines sit under the mock players.
+function mockCourtToVideo(x: number, y: number, courtW: number, courtH: number): [number, number] {
+  const nx = x / courtW;
+  const ny = y / courtH;
+  return [200 + nx * (1920 - 400) + (ny - 0.5) * 80, 380 + ny * 580];
+}
+
 export function StreamPlayer({
   telemetry,
   roster,
+  videoSrc,
+  notice,
   selectedPlayerId,
   onSelectPlayer,
   highlightMode,
@@ -33,8 +47,9 @@ export function StreamPlayer({
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [videoError, setVideoError] = useState(false);
+  const [videoFailed, setVideoFailed] = useState(false);
   const [loop, setLoop] = useState(true);
+  const videoError = videoSrc === null || videoFailed;
 
   const { metadata } = telemetry;
   const {
@@ -45,8 +60,7 @@ export function StreamPlayer({
     stepBackward,
     setPlaybackRate,
     seekToFrame,
-    playbackRate,
-    duration
+    playbackRate
   } = useVideoSync(videoRef, metadata.fps, metadata.total_frames, videoError);
 
   // Notify parent of frame updates
@@ -99,42 +113,56 @@ export function StreamPlayer({
         ctx.stroke();
       }
 
-      // Perspective broadcast court lines
+      // Court lines projected through the mock camera
+      const courtW = metadata.court_width;
+      const courtH = metadata.court_height;
+      const midY = courtH / 2;
+      const path = (points: [number, number][], close = false) => {
+        ctx.beginPath();
+        points.forEach(([x, y], i) => {
+          const [vx, vy] = mockCourtToVideo(x, y, courtW, courtH);
+          if (i === 0) ctx.moveTo(vx, vy);
+          else ctx.lineTo(vx, vy);
+        });
+        if (close) ctx.closePath();
+      };
+      const arc = (cx: number, cy: number, r: number, from: number, to: number): [number, number][] =>
+        Array.from({ length: 41 }, (_, i) => {
+          const a = from + ((to - from) * i) / 40;
+          return [cx + r * Math.cos(a), cy + r * Math.sin(a)] as [number, number];
+        });
+
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
       ctx.lineWidth = 2.5;
-
-      // Half-court line
-      ctx.beginPath();
-      ctx.moveTo(220, 360);
-      ctx.lineTo(1700, 360);
-      ctx.stroke();
-
-      // Center circle in perspective
-      ctx.beginPath();
-      ctx.ellipse(960, 360, 180, 50, 0, 0, Math.PI * 2);
-      ctx.stroke();
-
-      // Right 3-point arc & paint (attacking end)
-      ctx.beginPath();
-      ctx.ellipse(1460, 680, 420, 160, 0, -Math.PI * 0.9, Math.PI * 0.1);
-      ctx.stroke();
-
-      // Right key / paint
-      ctx.fillStyle = 'rgba(0, 122, 51, 0.08)';
-      ctx.beginPath();
-      ctx.moveTo(1340, 560);
-      ctx.lineTo(1680, 560);
-      ctx.lineTo(1750, 840);
-      ctx.lineTo(1270, 840);
-      ctx.closePath();
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.02)';
+      path([[0, 0], [courtW, 0], [courtW, courtH], [0, courtH]], true);
       ctx.fill();
       ctx.stroke();
+      path([[courtW / 2, 0], [courtW / 2, courtH]]);
+      ctx.stroke();
+      path(arc(courtW / 2, midY, 183, 0, Math.PI * 2), true);
+      ctx.stroke();
+
+      const cornerAngle = Math.asin((midY - 91) / 724);
+      [0, 1].forEach((side) => {
+        const fx = (d: number) => (side === 0 ? d : courtW - d);
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.06)';
+        path([[fx(0), midY - 244], [fx(579), midY - 244], [fx(579), midY + 244], [fx(0), midY + 244]], true);
+        ctx.fill();
+        ctx.stroke();
+        const threeArc = arc(160, midY, 724, -cornerAngle, cornerAngle)
+          .map(([x, y]) => [fx(x), y] as [number, number]);
+        path([[fx(0), 91], ...threeArc, [fx(0), courtH - 91]]);
+        ctx.stroke();
+        path(arc(fx(160), midY, 23, 0, Math.PI * 2), true);
+        ctx.stroke();
+      });
 
       // Broadcast watermark HUD header
       ctx.fillStyle = 'rgba(255, 255, 255, 0.4)';
       ctx.font = '600 13px Inter, sans-serif';
       ctx.textAlign = 'left';
-      ctx.fillText('LIVE STREAM FEED · 1080p60 SYNTHETIC BROADCAST', 40, 45);
+      ctx.fillText('SYNTHETIC COURT · MOCK TELEMETRY', 40, 45);
 
       ctx.fillStyle = 'rgba(239, 68, 68, 0.85)';
       ctx.beginPath();
@@ -143,7 +171,7 @@ export function StreamPlayer({
 
       ctx.restore();
     },
-    []
+    [metadata.court_width, metadata.court_height]
   );
 
   // Main canvas render pass
@@ -271,33 +299,31 @@ export function StreamPlayer({
       const canvas = canvasRef.current;
       if (!canvas) return;
 
+      // The canvas is letterboxed (object-contain): map through the drawn area.
       const rect = canvas.getBoundingClientRect();
-      const scaleX = canvas.width / rect.width;
-      const scaleY = canvas.height / rect.height;
-      const clickX = (e.clientX - rect.left) * scaleX;
-      const clickY = (e.clientY - rect.top) * scaleY;
+      const scale = Math.min(rect.width / canvas.width, rect.height / canvas.height);
+      if (scale <= 0) return;
+      const offsetX = (rect.width - canvas.width * scale) / 2;
+      const offsetY = (rect.height - canvas.height * scale) / 2;
+      const clickX = (e.clientX - rect.left - offsetX) / scale;
+      const clickY = (e.clientY - rect.top - offsetY) / scale;
 
       const frameData = telemetry.frames[currentFrame];
       if (!frameData) return;
 
-      // Hit test against all player bboxes (with a generous 15px hit margin)
+      // Hit test with a small margin; overlapping boxes resolve to the player
+      // nearest the camera (lowest feet).
+      let hit: PlayerFrame | null = null;
       for (const player of frameData.players) {
         const [x1, y1, x2, y2] = player.bbox;
-        if (
-          clickX >= x1 - 15 &&
-          clickX <= x2 + 15 &&
-          clickY >= y1 - 25 &&
-          clickY <= y2 + 15
-        ) {
-          onSelectPlayer(player.id === selectedPlayerId ? null : player.id);
-          return;
+        if (clickX >= x1 - 12 && clickX <= x2 + 12 && clickY >= y1 - 12 && clickY <= y2 + 12) {
+          if (!hit || y2 > hit.bbox[3]) hit = player;
         }
       }
+      if (hit) onSelectPlayer(hit.id === selectedPlayerId ? null : hit.id);
     },
     [currentFrame, telemetry, selectedPlayerId, onSelectPlayer]
   );
-
-  const timelinePercent = (currentFrame / Math.max(1, metadata.total_frames - 1)) * 100;
 
   return (
     <div className="flex flex-col h-full bg-[#0d121d] rounded-xl border border-gray-800/80 overflow-hidden shadow-2xl">
@@ -311,11 +337,13 @@ export function StreamPlayer({
           <video
             ref={videoRef}
             className="absolute inset-0 w-full h-full object-contain pointer-events-none"
-            src="/demo_clip.mp4"
+            src={videoSrc ?? undefined}
             loop={loop}
             muted
+            autoPlay
             playsInline
-            onError={() => setVideoError(true)}
+            preload="auto"
+            onError={() => setVideoFailed(true)}
           />
         ) : null}
 
@@ -327,10 +355,20 @@ export function StreamPlayer({
           onClick={handleCanvasClick}
         />
 
+        {notice && (
+          <div
+            id="stream-notice"
+            className="absolute top-4 left-4 z-20 flex items-start gap-2 max-w-md px-3 py-2 bg-black/70 backdrop-blur-md rounded-lg border border-amber-500/30 text-xs text-amber-200"
+          >
+            <Info size={14} className="mt-0.5 shrink-0" />
+            <span>{notice}</span>
+          </div>
+        )}
+
         {/* Live Broadcast Badge Overlay */}
         <div className="absolute top-4 right-4 z-20 flex items-center gap-2 px-3 py-1 bg-black/60 backdrop-blur-md rounded-full border border-white/10 text-xs font-mono text-gray-300">
           <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-          <span>{videoError ? 'SYNTHETIC 60 FPS' : 'LIVE 60 FPS'}</span>
+          <span>{videoError ? 'SYNTHETIC' : 'LIVE'} {Math.round(metadata.fps)} FPS</span>
         </div>
       </div>
 

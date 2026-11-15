@@ -6,8 +6,8 @@ Standalone script (requires ONLY standard library + numpy) that generates
 realistic mock basketball telemetry data for the Basketball Stream Tracker MVP.
 
 Outputs:
-  web/public/roster.json     - Player metadata matching Section 4.1
-  web/public/telemetry.json  - 450 frames @ 30 FPS matching Section 4.2
+  web/public/clips/synthetic/roster.json     - Player metadata matching Section 4.1
+  web/public/clips/synthetic/telemetry.json  - 450 frames @ 30 FPS matching Section 4.2
 """
 
 import json
@@ -24,7 +24,7 @@ NOISE_SIGMA = 15.0                      # cm
 INTERPOLATED_FRAC = 0.04                # ~4% frames flagged as interpolated
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT_DIR = PROJECT_ROOT / "web" / "public"
+OUT_DIR = PROJECT_ROOT / "web" / "public" / "clips" / "synthetic"
 
 # ──────────────────────────── roster ──────────────────────────────
 ROSTER_DATA = {
