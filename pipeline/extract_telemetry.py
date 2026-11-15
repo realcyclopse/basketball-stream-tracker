@@ -39,9 +39,11 @@ import supervision as sv
 from tqdm import tqdm
 
 from track_utils import (
+    COLOR_KEY,
     COURT_HEIGHT_CM,
     COURT_WIDTH_CM,
     DEFAULT_MATCH_INFO,
+    MAX_ON_COURT_PLAYERS,
     CourtProjector,
     assign_teams,
     bbox_to_body_polygon,
@@ -52,6 +54,7 @@ from track_utils import (
     load_court_vertices,
     mask_to_polygon,
     plausible_court_positions,
+    pop_track_colors,
 )
 from trajectory_smoother import smooth_trajectories
 
@@ -68,7 +71,6 @@ PLAYER_IOU = 0.9
 KEYPOINT_CONFIDENCE = 0.3        # model threshold
 KEYPOINT_ANCHOR_CONFIDENCE = 0.5 # landmarks trusted for the homography
 HOMOGRAPHY_CACHE_TTL = 10        # frames a stale homography may be reused
-COLOR_SAMPLE_EVERY = 5           # frames between jersey colour samples
 
 SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 SAM2_CHECKPOINT = "checkpoints/sam2.1_hiera_large.pt"
@@ -129,7 +131,7 @@ class RoboflowCourtDetector:
 # ---------------------------------------------------------------------------
 
 class ByteTrackTracker:
-    """Box tracker. Ids fragment on occlusion; consolidate_tracks stitches them."""
+    """Box tracker. Ids fragment and swap on occlusion; consolidate_tracks repairs them."""
 
     name = "bytetrack"
     has_masks = False
@@ -245,6 +247,7 @@ def process_video(
     match_info: Optional[Dict[str, Any]] = None,
     overwrite_roster: bool = False,
     min_track_frames: int = 15,
+    max_players: int = MAX_ON_COURT_PLAYERS,
     show_progress: bool = True,
 ) -> Dict[str, Any]:
     """Run the pipeline on one video and write its telemetry. Returns the telemetry dict."""
@@ -268,7 +271,6 @@ def process_video(
     valid_homographies = 0
 
     frames_data: List[Dict[str, Any]] = []
-    color_samples: Dict[int, List[np.ndarray]] = {}
     first_frame: Optional[np.ndarray] = None
     t_start = time.time()
 
@@ -334,10 +336,7 @@ def process_video(
             if polygon is None:
                 polygon = bbox_to_body_polygon(xyxy)
 
-            if frame_idx % COLOR_SAMPLE_EVERY == 0:
-                sample = jersey_color_sample(frame, xyxy, mask)
-                if sample is not None:
-                    color_samples.setdefault(tracker_id, []).append(sample)
+            color = jersey_color_sample(frame, xyxy, mask)
 
             position = None
             if court_xy is not None and on_court[i]:
@@ -351,6 +350,7 @@ def process_video(
                 "court_xy": position,
                 "speed_kmh": 0.0,
                 "is_interpolated": False,
+                COLOR_KEY: None if color is None else [float(v) for v in color],
             })
 
         frames_data.append({
@@ -373,13 +373,15 @@ def process_video(
     if valid_homographies == 0:
         log.warning("No valid homography in this clip — court positions will be empty")
 
-    # Track clean-up: stitch fragments (box trackers only), drop blips, renumber 1..N
-    id_map = consolidate_tracks(
+    # Track clean-up: undo id swaps and stitch fragments (box trackers only),
+    # drop blips, keep the players on the floor, renumber 1..N
+    player_ids = consolidate_tracks(
         frames_data,
         min_track_frames=min_track_frames,
         stitch=not getattr(tracker, "has_masks", False),
+        max_players=max_players,
     )
-    player_ids = sorted(set(id_map.values()))
+    colors = pop_track_colors(frames_data)
     log.info("%d player tracks kept", len(player_ids))
 
     metadata = {
@@ -409,11 +411,6 @@ def process_video(
 
     roster_path = os.path.join(output_dir, "roster.json")
     if overwrite_roster or not os.path.isfile(roster_path):
-        colors: Dict[int, np.ndarray] = {}
-        for raw_id, samples in color_samples.items():
-            if raw_id in id_map:
-                colors.setdefault(id_map[raw_id], []).extend(samples)  # type: ignore[arg-type]
-        colors = {pid: np.median(np.stack(samples), axis=0) for pid, samples in colors.items()}
         roster = build_draft_roster(player_ids, assign_teams(colors, match_info), match_info)
         with open(roster_path, "w", encoding="utf-8") as fp:
             json.dump(roster, fp, indent=2)
@@ -448,6 +445,8 @@ def parse_args() -> argparse.Namespace:
                         help="Regenerate roster.json even if one exists.")
     parser.add_argument("--min-track-frames", type=int, default=15,
                         help="Tracks seen in fewer frames are discarded.")
+    parser.add_argument("--max-players", type=int, default=MAX_ON_COURT_PLAYERS,
+                        help="Keep only this many longest tracks (0 = keep all).")
     return parser.parse_args()
 
 
@@ -506,6 +505,7 @@ def main() -> int:
                 match_info=match_info,
                 overwrite_roster=args.overwrite_roster,
                 min_track_frames=args.min_track_frames,
+                max_players=args.max_players,
             )
         except Exception:
             log.exception("Failed on %s", video_path)

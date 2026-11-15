@@ -6,6 +6,8 @@ Renders a synthetic clip (panning camera, six coloured "players" on a known
 court) and runs process_video with stub detectors in place of the Roboflow
 models, so no API key or GPU is needed. Tracking (ByteTrack), homography,
 track consolidation, smoothing, team clustering and file output are all real.
+Track consolidation is also checked on its own against a scripted id swap,
+a fragmented track and a referee.
 
     python test_pipeline.py
 """
@@ -23,7 +25,7 @@ import numpy as np
 import supervision as sv
 
 from extract_telemetry import ByteTrackTracker, process_video
-from track_utils import DEFAULT_MATCH_INFO, NBA_COURT_VERTICES_CM
+from track_utils import COLOR_KEY, DEFAULT_MATCH_INFO, NBA_COURT_VERTICES_CM, consolidate_tracks
 
 W, H, FPS, N_FRAMES = 1280, 720, 30, 90
 VERTICES = np.asarray(NBA_COURT_VERTICES_CM, dtype=np.float32)
@@ -108,6 +110,40 @@ def check(name: str, condition: bool, detail: str = "") -> bool:
     return condition
 
 
+def check_consolidation() -> bool:
+    """Tracker faults seen on real clips: an id swap, a fragmented track, a referee."""
+    white, blue, grey = [200.0, 128.0, 128.0], [80.0, 140.0, 90.0], [120.0, 128.0, 128.0]
+
+    def player(pid: int, x: float, color: list) -> dict:
+        return {"id": pid, "bbox": [x - 30, 250, x + 30, 400], "feet_video_xy": [x, 400], COLOR_KEY: color}
+
+    frames = []
+    for fi in range(80):
+        swapped = fi >= 40                       # two opponents cross and leave with each other's id
+        players = [
+            player(9 if swapped else 7, 100 + 5 * fi, white),
+            player(7 if swapped else 9, 505 - 5 * fi, blue),
+        ]
+        if fi not in (40, 41):                   # one player, two tracker ids
+            players.append(player(5 if fi < 40 else 11, 900, white))
+        if 10 <= fi <= 40:                       # referee walking through
+            players.append(player(20, 1100, grey))
+        frames.append({"frame_idx": fi, "players": players})
+
+    ids = consolidate_tracks(frames, max_players=3)
+    colors = {}
+    for frame in frames:
+        for p in frame["players"]:
+            colors.setdefault(p["id"], set()).add(tuple(p[COLOR_KEY]))
+
+    ok = check("consolidation: capped and renumbered", ids == [1, 2, 3], str(ids))
+    ok &= check("consolidation: id swap undone",
+                colors.get(1) == {tuple(white)} and colors.get(2) == {tuple(blue)})
+    ok &= check("consolidation: fragments stitched, referee dropped",
+                colors.get(3) == {tuple(white)} and sum(len(f["players"]) for f in frames) == 80 * 3 - 2)
+    return ok
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         clip_dir = Path(tmp) / "synthetic-clip"
@@ -127,10 +163,11 @@ def main() -> int:
         calibration_exists = (clip_dir / "frame_0_calibration.jpg").is_file()
 
     frames, meta = telemetry["frames"], telemetry["metadata"]
-    ok = True
+    ok = check_consolidation()
     ok &= check("frame count", meta["total_frames"] == N_FRAMES == len(frames), str(meta["total_frames"]))
     ok &= check("valid JSON numbers", "NaN" not in raw and "Infinity" not in raw)
     ok &= check("calibration frame written", calibration_exists)
+    ok &= check("no working fields in output", COLOR_KEY not in raw)
 
     ids = sorted({p["id"] for f in frames for p in f["players"]})
     ok &= check("ids renumbered 1..6", ids == [1, 2, 3, 4, 5, 6], str(ids))

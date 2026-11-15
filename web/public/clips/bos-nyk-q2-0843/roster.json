@@ -1,0 +1,98 @@
+{
+  "match_info": {
+    "home_team": {
+      "code": "BOS",
+      "name": "Boston Celtics",
+      "color": "#007A33",
+      "accent": "#BA9653"
+    },
+    "away_team": {
+      "code": "NYK",
+      "name": "New York Knicks",
+      "color": "#006BB6",
+      "accent": "#F58426"
+    }
+  },
+  "players": {
+    "1": {
+      "id": 1,
+      "name": "Derrick White",
+      "shortName": "WHITE",
+      "number": "9",
+      "team": "BOS",
+      "position": "PG"
+    },
+    "2": {
+      "id": 2,
+      "name": "Josh Hart",
+      "shortName": "HART",
+      "number": "3",
+      "team": "NYK",
+      "position": "SG"
+    },
+    "3": {
+      "id": 3,
+      "name": "Mikal Bridges",
+      "shortName": "BRIDGES",
+      "number": "25",
+      "team": "NYK",
+      "position": "SF"
+    },
+    "4": {
+      "id": 4,
+      "name": "Jalen Brunson",
+      "shortName": "BRUNSON",
+      "number": "11",
+      "team": "NYK",
+      "position": "PG"
+    },
+    "5": {
+      "id": 5,
+      "name": "Mitchell Robinson",
+      "shortName": "ROBINSON",
+      "number": "23",
+      "team": "NYK",
+      "position": "C"
+    },
+    "6": {
+      "id": 6,
+      "name": "Jaylen Brown",
+      "shortName": "BROWN",
+      "number": "7",
+      "team": "BOS",
+      "position": "SG"
+    },
+    "7": {
+      "id": 7,
+      "name": "Jrue Holiday",
+      "shortName": "HOLIDAY",
+      "number": "4",
+      "team": "BOS",
+      "position": "PG"
+    },
+    "8": {
+      "id": 8,
+      "name": "Miles McBride",
+      "shortName": "McBRIDE",
+      "number": "2",
+      "team": "NYK",
+      "position": "PG"
+    },
+    "9": {
+      "id": 9,
+      "name": "Kristaps Porziņģis",
+      "shortName": "PORZINGIS",
+      "number": "8",
+      "team": "BOS",
+      "position": "C"
+    },
+    "10": {
+      "id": 10,
+      "name": "Payton Pritchard",
+      "shortName": "PRITCHARD",
+      "number": "11",
+      "team": "BOS",
+      "position": "PG"
+    }
+  }
+}

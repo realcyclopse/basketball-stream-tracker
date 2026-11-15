@@ -71,9 +71,9 @@ export function drawFloorRing(
   const bottomHalfWidth = rx * 0.85;
 
   const gradient = ctx.createLinearGradient(feetX, feetY, feetX, feetY - beamHeight);
-  gradient.addColorStop(0, hexToRgba(color, 0.3));
+  gradient.addColorStop(0, hexToRgba(color, 0.55));
   if (accent) {
-    gradient.addColorStop(0.5, hexToRgba(accent, 0.15));
+    gradient.addColorStop(0.5, hexToRgba(accent, 0.3));
   }
   gradient.addColorStop(1, hexToRgba(color, 0));
 
@@ -108,10 +108,22 @@ export function drawFloorRing(
     ctx.stroke();
   }
 
-  // 3. Main ellipse: 3px stroke in color
-  ctx.beginPath();
-  ctx.ellipse(feetX, feetY, rx, ry, 0, 0, Math.PI * 2);
-  ctx.lineWidth = 3;
+  // 3. Main ellipse: dark outer edge + white band + team colour, so the ring
+  // stays visible over any floor or jersey colour
+  const mainRing = () => {
+    ctx.beginPath();
+    ctx.ellipse(feetX, feetY, rx, ry, 0, 0, Math.PI * 2);
+  };
+  mainRing();
+  ctx.lineWidth = 11;
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.75)';
+  ctx.stroke();
+  mainRing();
+  ctx.lineWidth = 8;
+  ctx.strokeStyle = '#ffffff';
+  ctx.stroke();
+  mainRing();
+  ctx.lineWidth = 4;
   ctx.strokeStyle = color;
   ctx.stroke();
 
@@ -154,28 +166,28 @@ export function drawNeonContour(
     ctx.closePath();
   };
 
-  // Outer glow: 14px stroke at 10% opacity
+  // Fill with color at 25% opacity
   buildPolygonPath();
-  ctx.lineWidth = 14;
-  ctx.strokeStyle = hexToRgba(color, 0.1);
-  ctx.stroke();
-
-  // Outer glow: 8px stroke at 20% opacity
-  buildPolygonPath();
-  ctx.lineWidth = 8;
-  ctx.strokeStyle = hexToRgba(color, 0.2);
-  ctx.stroke();
-
-  // Fill with color at 15% opacity
-  buildPolygonPath();
-  ctx.fillStyle = hexToRgba(color, 0.15);
+  ctx.fillStyle = hexToRgba(color, 0.25);
   ctx.fill();
 
-  // Main stroke: 3px in color with shadow glow
-  ctx.shadowColor = color;
-  ctx.shadowBlur = 15;
+  // Dark outer edge, white band, then team colour on top
   buildPolygonPath();
-  ctx.lineWidth = 3;
+  ctx.lineWidth = 11;
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.75)';
+  ctx.stroke();
+
+  buildPolygonPath();
+  ctx.lineWidth = 8;
+  ctx.strokeStyle = '#ffffff';
+  ctx.shadowColor = '#ffffff';
+  ctx.shadowBlur = 12;
+  ctx.stroke();
+
+  ctx.shadowBlur = 0;
+  buildPolygonPath();
+  ctx.lineWidth = 4;
   ctx.strokeStyle = color;
   ctx.stroke();
 
@@ -214,10 +226,8 @@ export function drawCornerBrackets(
 
   ctx.save();
   ctx.setLineDash([]);
-  ctx.lineWidth = 2;
-  ctx.strokeStyle = color;
-  ctx.shadowColor = color;
-  ctx.shadowBlur = 8;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
 
   ctx.beginPath();
   // Top-left: horizontal right + vertical down
@@ -240,14 +250,27 @@ export function drawCornerBrackets(
   ctx.lineTo(right, bottom);
   ctx.lineTo(right, bottom - armLength);
 
+  // Dark edge, white band, team colour core
+  ctx.lineWidth = 9;
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.75)';
+  ctx.stroke();
+  ctx.lineWidth = 6;
+  ctx.strokeStyle = '#ffffff';
+  ctx.stroke();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = color;
   ctx.stroke();
 
-  // Add small crosshair dot at center of bbox
+  // Crosshair dot at center of bbox
   const centerX = (left + right) / 2;
   const centerY = (top + bottom) / 2;
 
   ctx.beginPath();
-  ctx.arc(centerX, centerY, 2.5, 0, Math.PI * 2);
+  ctx.arc(centerX, centerY, 5, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, 3, 0, Math.PI * 2);
   ctx.fillStyle = color;
   ctx.fill();
 
@@ -325,12 +348,12 @@ export function drawPlayerBadge(
   }
 
   // Background: rgba(0,0,0,0.75) rounded rectangle
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
   ctx.fill();
 
-  // Border: 1px in color
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = color;
+  // Border: white edge so the badge stands out from the footage
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#ffffff';
   ctx.stroke();
 
   const centerY = badgeY + badgeHeight / 2;
@@ -370,9 +393,9 @@ export function drawPlayerBadge(
 
 /**
  * Small indicator dot for unselected players:
- * - Circle at feetXY with radius 5
- * - Fill with color at 40% opacity
- * - Thin 1px border in color at 60% opacity
+ * - Circle at feetXY with radius 7
+ * - Fill with color at 90% opacity
+ * - 2px white border
  */
 export function drawSubtleDot(
   ctx: CanvasRenderingContext2D,
@@ -385,13 +408,13 @@ export function drawSubtleDot(
   const [x, y] = feetXY;
 
   ctx.beginPath();
-  ctx.arc(x, y, 5, 0, Math.PI * 2);
+  ctx.arc(x, y, 7, 0, Math.PI * 2);
 
-  ctx.fillStyle = hexToRgba(color, 0.4);
+  ctx.fillStyle = hexToRgba(color, 0.9);
   ctx.fill();
 
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = hexToRgba(color, 0.6);
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#ffffff';
   ctx.stroke();
 
   ctx.restore();

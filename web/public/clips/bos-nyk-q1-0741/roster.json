@@ -1,0 +1,98 @@
+{
+  "match_info": {
+    "home_team": {
+      "code": "BOS",
+      "name": "Boston Celtics",
+      "color": "#007A33",
+      "accent": "#BA9653"
+    },
+    "away_team": {
+      "code": "NYK",
+      "name": "New York Knicks",
+      "color": "#006BB6",
+      "accent": "#F58426"
+    }
+  },
+  "players": {
+    "1": {
+      "id": 1,
+      "name": "Mikal Bridges",
+      "shortName": "BRIDGES",
+      "number": "25",
+      "team": "NYK",
+      "position": "SF"
+    },
+    "2": {
+      "id": 2,
+      "name": "Jaylen Brown",
+      "shortName": "BROWN",
+      "number": "7",
+      "team": "BOS",
+      "position": "SG"
+    },
+    "3": {
+      "id": 3,
+      "name": "Jalen Brunson",
+      "shortName": "BRUNSON",
+      "number": "11",
+      "team": "NYK",
+      "position": "PG"
+    },
+    "4": {
+      "id": 4,
+      "name": "Derrick White",
+      "shortName": "WHITE",
+      "number": "9",
+      "team": "BOS",
+      "position": "PG"
+    },
+    "5": {
+      "id": 5,
+      "name": "Jrue Holiday",
+      "shortName": "HOLIDAY",
+      "number": "4",
+      "team": "BOS",
+      "position": "PG"
+    },
+    "6": {
+      "id": 6,
+      "name": "Miles McBride",
+      "shortName": "McBRIDE",
+      "number": "2",
+      "team": "NYK",
+      "position": "PG"
+    },
+    "7": {
+      "id": 7,
+      "name": "Karl-Anthony Towns",
+      "shortName": "TOWNS",
+      "number": "32",
+      "team": "NYK",
+      "position": "C"
+    },
+    "8": {
+      "id": 8,
+      "name": "Kristaps Porziņģis",
+      "shortName": "PORZINGIS",
+      "number": "8",
+      "team": "BOS",
+      "position": "C"
+    },
+    "9": {
+      "id": 9,
+      "name": "OG Anunoby",
+      "shortName": "ANUNOBY",
+      "number": "8",
+      "team": "NYK",
+      "position": "SF"
+    },
+    "10": {
+      "id": 10,
+      "name": "Jayson Tatum",
+      "shortName": "TATUM",
+      "number": "0",
+      "team": "BOS",
+      "position": "SF"
+    }
+  }
+}

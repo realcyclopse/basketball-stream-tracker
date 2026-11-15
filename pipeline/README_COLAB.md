@@ -61,7 +61,9 @@ python extract_telemetry.py --video my.mp4 --output-dir out/
 
 Useful flags: `--overwrite-roster` (regenerate an existing `roster.json`),
 `--match-info teams.json` (other teams: `{"home_team": {...}, "away_team": {...}}`
-with `code`, `name`, `color`, `accent`), `--min-track-frames N`.
+with `code`, `name`, `color`, `accent`), `--min-track-frames N`,
+`--max-players N` (default 10; only the N longest tracks are kept, so ids run
+1..10 and referees / bench players picked up for a moment are dropped; 0 = keep all).
 
 Re-running a clip can change tracker ids, so redo its `roster.json` afterwards.
 
@@ -80,3 +82,6 @@ Re-running a clip can change tracker ids, so redo its `roster.json` afterwards.
 - **Players on the wrong team** — fix `team` in `roster.json`.
 - **Too many / duplicate players** — raise `--min-track-frames` or `--confidence`,
   or use the SAM2 tracker.
+- **A label jumps to another player** — ByteTrack swapped two ids. Swaps between
+  opponents are undone from jersey colour; swaps between team-mates are not
+  detected. Use the SAM2 tracker for those clips.

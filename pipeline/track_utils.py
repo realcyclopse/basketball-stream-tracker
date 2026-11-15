@@ -6,7 +6,7 @@ without Roboflow, SAM2 or a GPU:
 
   * court geometry + homography fitting
   * mask -> polygon conversion
-  * track stitching, short-track removal and id renumbering
+  * id-swap repair, track stitching, on-court player cap and id renumbering
   * jersey-colour team clustering and draft roster generation
 """
 
@@ -168,6 +168,18 @@ def bbox_to_body_polygon(xyxy: Sequence[float], points: int = 16) -> List[List[f
 # Track consolidation
 # ---------------------------------------------------------------------------
 
+MAX_ON_COURT_PLAYERS = 10
+COLOR_KEY = "_color"            # per-frame torso colour, stripped before output
+STITCH_MAX_OVERLAP = 8          # frames two fragments of one player may overlap
+COLOR_MATCH_RATIO = 0.6         # of the distance between the two team colours
+SWAP_MIN_IOU = 0.15             # box overlap that counts as two people crossing
+SWAP_RUN_GAP = 5                # frames; shorter breaks do not end a crossing
+SWAP_WINDOW = 20                # frames of colour compared either side of a crossing
+SWAP_MIN_SAMPLES = 5
+SWAP_GAIN_RATIO = 0.5           # colour evidence needed, as a share of the team colour distance
+SWAP_MAX_REPAIRS = 200
+
+
 def _collect_tracks(frames: List[Dict[str, Any]]) -> Dict[int, List[int]]:
     tracks: Dict[int, List[int]] = {}
     for fi, frame in enumerate(frames):
@@ -180,31 +192,176 @@ def _player_at(frames: List[Dict[str, Any]], fi: int, pid: int) -> Dict[str, Any
     return next(p for p in frames[fi]["players"] if int(p["id"]) == pid)
 
 
-def stitch_tracks(frames: List[Dict[str, Any]], max_gap: int = 25) -> Dict[int, int]:
+def _track_colors(frames: List[Dict[str, Any]]) -> Dict[int, np.ndarray]:
+    """Median torso colour per track id (tracks without samples are left out)."""
+    samples: Dict[int, List[Sequence[float]]] = {}
+    for frame in frames:
+        for player in frame["players"]:
+            if player.get(COLOR_KEY) is not None:
+                samples.setdefault(int(player["id"]), []).append(player[COLOR_KEY])
+    return {pid: np.median(np.asarray(vals, dtype=np.float32), axis=0) for pid, vals in samples.items()}
+
+
+def team_color_separation(frames: List[Dict[str, Any]]) -> Optional[float]:
+    """Lab distance between the two jersey colours (None without colour samples)."""
+    samples = [p[COLOR_KEY] for f in frames for p in f["players"] if p.get(COLOR_KEY) is not None]
+    if len(samples) < 20:
+        return None
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.1)
+    cv2.setRNGSeed(0)
+    _, _, centers = cv2.kmeans(np.asarray(samples, dtype=np.float32), 2, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+    return float(np.linalg.norm(centers[0] - centers[1]))
+
+
+def _iou(a: Sequence[float], b: Sequence[float]) -> float:
+    iw = min(a[2], b[2]) - max(a[0], b[0])
+    ih = min(a[3], b[3]) - max(a[1], b[1])
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    return inter / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+
+
+def _window_color(track: Dict[int, Dict[str, Any]], lo: int, hi: int) -> Optional[np.ndarray]:
+    samples = [track[fi][COLOR_KEY] for fi in range(lo, hi + 1)
+               if fi in track and track[fi].get(COLOR_KEY) is not None]
+    if len(samples) < SWAP_MIN_SAMPLES:
+        return None
+    return np.median(np.asarray(samples, dtype=np.float64), axis=0)
+
+
+def _find_swap(
+    a: Dict[int, Dict[str, Any]],
+    b: Dict[int, Dict[str, Any]],
+    min_gain: float,
+) -> Optional[int]:
+    """First frame from which tracks a and b carry each other's player, if any."""
+    both = sorted(set(a) & set(b))
+    touching = [fi for fi in both if _iou(a[fi]["bbox"], b[fi]["bbox"]) > SWAP_MIN_IOU]
+    # A crossing lasts until the two are seen apart for a while; frames where
+    # the detector merged them into one box do not end it.
+    runs: List[List[int]] = []
+    for fi in touching:
+        if runs and sum(1 for k in both if runs[-1][1] < k < fi) <= SWAP_RUN_GAP:
+            runs[-1][1] = fi
+        else:
+            runs.append([fi, fi])
+
+    def feet(track: Dict[int, Dict[str, Any]], fi: int) -> np.ndarray:
+        return np.asarray(track[fi]["feet_video_xy"], dtype=np.float64)
+
+    def motion_cost(k: int) -> float:
+        """Negative when exchanging the ids at frame k gives smoother motion."""
+        if not all(fi in t for fi in (k - 1, k) for t in (a, b)):
+            return np.inf
+        return float(np.linalg.norm(feet(a, k) - feet(b, k - 1)) + np.linalg.norm(feet(b, k) - feet(a, k - 1))
+                     - np.linalg.norm(feet(a, k) - feet(a, k - 1)) - np.linalg.norm(feet(b, k) - feet(b, k - 1)))
+
+    def gain(before_lo: int, before_hi: int, after_lo: int, after_hi: int) -> float:
+        before = [_window_color(t, before_lo, before_hi) for t in (a, b)]
+        after = [_window_color(t, after_lo, after_hi) for t in (a, b)]
+        if any(c is None for c in before + after):
+            return -np.inf
+        keep = np.linalg.norm(before[0] - after[0]) + np.linalg.norm(before[1] - after[1])
+        swap = np.linalg.norm(before[0] - after[1]) + np.linalg.norm(before[1] - after[0])
+        return float(keep - swap)
+
+    for start, end in runs:
+        at = min(range(start, end + 2), key=motion_cost)
+        if not np.isfinite(motion_cost(at)):
+            at = (start + end + 1) // 2
+        before, after = (start - SWAP_WINDOW, start - 1), (end + 1, end + SWAP_WINDOW)
+        evidence = gain(*before, *after)
+        if np.isfinite(evidence):
+            if evidence >= min_gain:
+                return at
+            continue
+        # A track (or the clip) starts or ends inside the crossing, so one of
+        # the two windows is empty: look for the frame inside it that splits
+        # the colours best instead, leaving out frames where exchanging the
+        # ids would make both players jump.
+        has_before = all(_window_color(t, *before) is not None for t in (a, b))
+        has_after = all(_window_color(t, *after) is not None for t in (a, b))
+        scores = {k: gain(*(before if has_before else (k - SWAP_WINDOW, k - 1)),
+                          *(after if has_after else (k, k + SWAP_WINDOW - 1)))
+                  for k in range(start, end + 2) if not 0 < motion_cost(k) < np.inf}
+        if scores:
+            at = max(scores, key=lambda k: (scores[k], -abs(k - at)))
+            if scores[at] >= min_gain:
+                return at
+    return None
+
+
+def repair_id_swaps(frames: List[Dict[str, Any]], min_gain: float) -> int:
     """
-    Merge track fragments: a track that starts shortly after another one ended,
-    close to where it ended, is the same player with a new tracker id.
+    Box trackers exchange ids when two people cross. Where two overlapping
+    tracks come out of the overlap wearing each other's torso colour (other
+    team, or a referee), exchange their ids back from that frame on.
+    Swaps between team-mates leave no colour evidence and are not detected.
+
+    Rewrites ids in place. Returns the number of swaps undone.
+    """
+    swaps = 0
+    for _ in range(SWAP_MAX_REPAIRS):
+        tracks: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        for fi, frame in enumerate(frames):
+            for player in frame["players"]:
+                tracks.setdefault(int(player["id"]), {})[fi] = player
+
+        found = None
+        ids = sorted(tracks)
+        for i, pa in enumerate(ids):
+            for pb in ids[i + 1:]:
+                at = _find_swap(tracks[pa], tracks[pb], min_gain)
+                if at is not None and (found is None or at < found[2]):
+                    found = (pa, pb, at)
+        if found is None:
+            break
+
+        pa, pb, at = found
+        for pid, other in ((pa, pb), (pb, pa)):
+            for fi, player in tracks[pid].items():
+                if fi >= at:
+                    player["id"] = other
+        swaps += 1
+    return swaps
+
+
+def stitch_tracks(
+    frames: List[Dict[str, Any]],
+    max_gap: int = 25,
+    max_color_delta: Optional[float] = None,
+) -> Dict[int, int]:
+    """
+    Merge track fragments: a track that starts shortly after another one ended
+    (or while it is ending), close to where it ended, is the same player with
+    a new tracker id. With `max_color_delta` the torso colours must match too.
 
     Rewrites ids in place and returns {old_id: merged_id}.
     """
     tracks = _collect_tracks(frames)
-    order = sorted(tracks, key=lambda pid: tracks[pid][0])
+    colors = _track_colors(frames) if max_color_delta is not None else {}
+    order = sorted(tracks, key=lambda pid: (tracks[pid][0], tracks[pid][-1]))
     mapping = {pid: pid for pid in tracks}
-    # merged id -> (last frame, feet xy, bbox width)
-    tails: Dict[int, Tuple[int, np.ndarray, float]] = {}
+    # merged id -> (last frame, feet xy, bbox width, colour)
+    tails: Dict[int, Tuple[int, np.ndarray, float, Optional[np.ndarray]]] = {}
 
     for pid in order:
         first_fi = tracks[pid][0]
         first = _player_at(frames, first_fi, pid)
         feet = np.asarray(first["feet_video_xy"], dtype=np.float64)
+        color = colors.get(pid)
 
         best, best_dist = None, np.inf
-        for root, (last_fi, last_feet, last_width) in tails.items():
+        for root, (last_fi, last_feet, last_width, last_color) in tails.items():
             gap = first_fi - last_fi - 1
-            if gap < 0 or gap > max_gap:
+            if gap < -STITCH_MAX_OVERLAP or gap > max_gap or tracks[pid][-1] <= last_fi:
+                continue
+            if (color is not None and last_color is not None
+                    and float(np.linalg.norm(color - last_color)) > max_color_delta):
                 continue
             dist = float(np.linalg.norm(feet - last_feet))
-            if dist <= max(1.5 * last_width, 60.0) + 8.0 * gap and dist < best_dist:
+            if dist <= max(1.5 * last_width, 60.0) + 8.0 * max(gap, 0) and dist < best_dist:
                 best, best_dist = root, dist
 
         root = best if best is not None else pid
@@ -212,11 +369,14 @@ def stitch_tracks(frames: List[Dict[str, Any]], max_gap: int = 25) -> Dict[int, 
         last_fi = tracks[pid][-1]
         last = _player_at(frames, last_fi, pid)
         width = float(last["bbox"][2] - last["bbox"][0])
-        tails[root] = (last_fi, np.asarray(last["feet_video_xy"], dtype=np.float64), width)
+        tails[root] = (last_fi, np.asarray(last["feet_video_xy"], dtype=np.float64), width, color)
 
     for frame in frames:
+        players: Dict[int, Dict[str, Any]] = {}
         for player in frame["players"]:
             player["id"] = mapping[int(player["id"])]
+            players[player["id"]] = player      # overlapping fragments: keep one
+        frame["players"] = list(players.values())
     return mapping
 
 
@@ -225,21 +385,28 @@ def consolidate_tracks(
     min_track_frames: int = 15,
     stitch: bool = True,
     max_gap: int = 25,
-) -> Dict[int, int]:
+    max_players: int = MAX_ON_COURT_PLAYERS,
+) -> List[int]:
     """
-    Stitch fragments, drop tracks seen in fewer than `min_track_frames` frames
-    and renumber the survivors 1..N (by first appearance, then left to right).
+    Undo id swaps, stitch fragments, drop tracks seen in fewer than
+    `min_track_frames` frames, keep the `max_players` longest tracks (0 = keep
+    all) and renumber the survivors 1..N (by first appearance, then left to
+    right). Referees and bench players picked up for a moment go with the cap.
 
-    Rewrites `frames` in place. Returns {raw_tracker_id: final_id} for the
-    tracker ids that survived.
+    Rewrites `frames` in place. Returns the final ids.
     """
-    merged = stitch_tracks(frames, max_gap=max_gap) if stitch else {
-        pid: pid for pid in _collect_tracks(frames)
-    }
+    if stitch:
+        separation = team_color_separation(frames)
+        max_delta = COLOR_MATCH_RATIO * separation if separation else None
+        if separation:
+            repair_id_swaps(frames, min_gain=SWAP_GAIN_RATIO * separation)
+        stitch_tracks(frames, max_gap=max_gap, max_color_delta=max_delta)
 
     tracks = _collect_tracks(frames)
     min_len = min(min_track_frames, max(1, len(frames) // 4))
     kept = [pid for pid, fis in tracks.items() if len(fis) >= min_len]
+    if max_players > 0:
+        kept = sorted(kept, key=lambda pid: len(tracks[pid]), reverse=True)[:max_players]
 
     def sort_key(pid: int) -> Tuple[int, float]:
         first_fi = tracks[pid][0]
@@ -255,7 +422,16 @@ def consolidate_tracks(
                 players.append(player)
         frame["players"] = sorted(players, key=lambda p: p["id"])
 
-    return {raw: final[root] for raw, root in merged.items() if root in final}
+    return sorted(final.values())
+
+
+def pop_track_colors(frames: List[Dict[str, Any]]) -> Dict[int, np.ndarray]:
+    """Median torso colour per track; removes the per-frame samples from `frames`."""
+    colors = _track_colors(frames)
+    for frame in frames:
+        for player in frame["players"]:
+            player.pop(COLOR_KEY, None)
+    return colors
 
 
 # ---------------------------------------------------------------------------
@@ -273,12 +449,12 @@ def jersey_color_sample(
     xyxy: Sequence[float],
     mask: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
-    """Mean Lab colour of the torso region of a player box (None if too small)."""
+    """Median Lab colour of the torso region of a player box (None if too small)."""
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = map(float, xyxy)
     bw, bh = x2 - x1, y2 - y1
-    tx1, tx2 = int(max(0, x1 + 0.25 * bw)), int(min(w, x2 - 0.25 * bw))
-    ty1, ty2 = int(max(0, y1 + 0.15 * bh)), int(min(h, y1 + 0.50 * bh))
+    tx1, tx2 = int(max(0, x1 + 0.30 * bw)), int(min(w, x2 - 0.30 * bw))
+    ty1, ty2 = int(max(0, y1 + 0.18 * bh)), int(min(h, y1 + 0.45 * bh))
     if tx2 - tx1 < 3 or ty2 - ty1 < 3:
         return None
     lab = cv2.cvtColor(frame[ty1:ty2, tx1:tx2], cv2.COLOR_BGR2LAB).reshape(-1, 3)
@@ -286,7 +462,7 @@ def jersey_color_sample(
         inside = mask[ty1:ty2, tx1:tx2].reshape(-1).astype(bool)
         if inside.sum() >= 9:
             lab = lab[inside]
-    return lab.mean(axis=0).astype(np.float32)
+    return np.median(lab, axis=0).astype(np.float32)
 
 
 def _hex_to_lab(color: str) -> np.ndarray:
