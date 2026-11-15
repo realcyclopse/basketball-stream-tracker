@@ -36,7 +36,7 @@ APP_NAME = "courtview-stream-tracker"
 # Define the container with GPU-accelerated PyTorch, OpenCV, Supervision, and Roboflow Inference
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("libgl1-mesa-glx", "libglib2.0-0", "ffmpeg")
+    .apt_install("libgl1", "ffmpeg", "git")
     .pip_install(
         "supervision>=0.25.0",
         "inference-gpu>=0.25.0",
