@@ -3,12 +3,11 @@ modal_app.py — Serverless GPU Pipeline for Basketball Stream Telemetry.
 
 Runs player detection (RF-DETR), court keypoint detection (33 landmarks),
 homography projection, ByteTrack / SAM 2 tracking, and trajectory smoothing
-on an NVIDIA A10G or T4 GPU on Modal.com.
+on an NVIDIA T4 or A10G GPU on Modal.com.
 
 Features:
-  - Cold starts in ~2-3 seconds.
   - 100% serverless: scales to 0 when idle ($0.00/month standby cost).
-  - Webhook API endpoint for direct upload from the CourtView Live web dashboard.
+  - Webhook API endpoint with CORS for direct upload from the web app.
   - CLI runner for fast local testing: `modal run pipeline/modal_app.py --video clip.mp4`
 
 Setup & Deployment:
@@ -63,24 +62,15 @@ roboflow_secret = modal.Secret.from_name("roboflow-secret", required_keys=["ROBO
 
 
 # ---------------------------------------------------------------------------
-# Core Serverless GPU Processing Function
+# Core Processing Helper (Runs inside GPU container)
 # ---------------------------------------------------------------------------
 
-@app.function(
-    gpu="A10G",              # Fast modern GPU (~$0.000306/sec). Can also use "T4" for budget tier.
-    timeout=300,             # 5 minute max timeout per video
-    secrets=[roboflow_secret],
-)
-def process_video_task(
+def _run_pipeline(
     video_bytes: bytes,
     filename: str = "input_clip.mp4",
     tracker: str = "bytetrack",
     match_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Executes the full Computer Vision tracking pipeline on a video file inside
-    a dedicated GPU container.
-    """
     import sys
     sys.path.append("/root/pipeline")
     import extract_telemetry as pipeline
@@ -92,7 +82,7 @@ def process_video_task(
     os.makedirs(output_dir, exist_ok=True)
 
     try:
-        # Write incoming video bytes to temporary disk
+        # Write incoming video bytes to disk
         with open(input_path, "wb") as f:
             f.write(video_bytes)
 
@@ -105,7 +95,6 @@ def process_video_task(
         if tracker_choice == "bytetrack":
             tracker_factory = pipeline.ByteTrackTracker
         elif tracker_choice == "sam2":
-            # Attempt to load SAM 2 if installed in container, fallback to ByteTrack
             sam2_cfg = os.environ.get("SAM2_CONFIG", pipeline.SAM2_CONFIG)
             sam2_ckpt = os.environ.get("SAM2_CHECKPOINT", pipeline.SAM2_CHECKPOINT)
             predictor = pipeline.load_sam2_predictor(sam2_cfg, sam2_ckpt)
@@ -162,32 +151,46 @@ def process_video_task(
         }
 
     finally:
-        # Clean up temporary files
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
-# Public Webhook / REST API Endpoint (with CORS Support)
+# Modal GPU Function (Callable via Python SDK / CLI)
 # ---------------------------------------------------------------------------
 
 @app.function(
-    gpu="A10G",
+    gpu="T4",                 # Default: T4 GPU (~$0.59/hr = ~$0.0016 per clip). Can switch to "A10G".
     timeout=300,
     secrets=[roboflow_secret],
 )
-@modal.fastapi_endpoint(method="POST")
-def analyze_clip(request: Any):
-    """
-    Public HTTP API endpoint called by the CourtView Live web application.
-    Accepts multipart/form-data or application/json.
-    """
-    from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+def process_video_task(
+    video_bytes: bytes,
+    filename: str = "input_clip.mp4",
+    tracker: str = "bytetrack",
+    match_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return _run_pipeline(video_bytes, filename, tracker, match_info)
+
+
+# ---------------------------------------------------------------------------
+# Public Webhook / REST API Endpoint (FastAPI with CORS via asgi_app)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    gpu="T4",                 # Uses T4 GPU for low-cost, high-speed execution
+    timeout=300,
+    secrets=[roboflow_secret],
+)
+@modal.asgi_app()
+def api():
+    from fastapi import FastAPI, File, Form, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
 
-    # Create inner FastAPI handler with CORS enabled
-    sub_app = FastAPI(title="CourtView Video Analyzer API")
-    sub_app.add_middleware(
+    web_app = FastAPI(title="CourtView Video Analyzer API")
+
+    # Enable CORS for browser access from Vercel & localhost
+    web_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_credentials=True,
@@ -195,44 +198,37 @@ def analyze_clip(request: Any):
         allow_headers=["*"],
     )
 
-    return sub_app
+    @web_app.post("/analyze")
+    @web_app.post("/")
+    async def analyze(
+        video: UploadFile = File(...),
+        tracker: str = Form("bytetrack"),
+        match_info_json: Optional[str] = Form(None),
+    ):
+        match_info = None
+        if match_info_json:
+            try:
+                match_info = json.loads(match_info_json)
+            except Exception:
+                match_info = None
 
+        video_bytes = await video.read()
+        if len(video_bytes) == 0:
+            return JSONResponse(status_code=400, content={"status": "error", "message": "Video is empty."})
 
-# FastAPI web endpoint setup for direct multipart upload
-@app.function(
-    gpu="A10G",
-    timeout=300,
-    secrets=[roboflow_secret],
-)
-@modal.fastapi_endpoint(method="POST")
-async def analyze_video(
-    video: modal.fastapi.UploadFile = modal.fastapi.File(...),
-    tracker: str = modal.fastapi.Form("bytetrack"),
-    match_info_json: Optional[str] = modal.fastapi.Form(None),
-):
-    """
-    FastAPI multipart video upload endpoint.
-    Usage from browser or cURL:
-      curl -X POST https://<modal-url> -F "video=@clip.mp4" -F "tracker=bytetrack"
-    """
-    match_info = None
-    if match_info_json:
-        try:
-            match_info = json.loads(match_info_json)
-        except Exception:
-            match_info = None
+        result = _run_pipeline(
+            video_bytes=video_bytes,
+            filename=video.filename or "upload.mp4",
+            tracker=tracker,
+            match_info=match_info,
+        )
+        return result
 
-    video_bytes = await video.read()
-    if len(video_bytes) == 0:
-        return {"status": "error", "message": "Uploaded video file is empty."}
+    @web_app.get("/")
+    def health():
+        return {"status": "ok", "service": "CourtView Video Analyzer API", "gpu": "NVIDIA T4"}
 
-    result = process_video_task.local(
-        video_bytes=video_bytes,
-        filename=video.filename or "upload.mp4",
-        tracker=tracker,
-        match_info=match_info,
-    )
-    return result
+    return web_app
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +250,7 @@ def main(
         print(f"Error: Video file not found: {video}")
         return
 
-    print(f"Uploading {video_path.name} ({video_path.stat().st_size / 1e6:.1f} MB) to Modal A10G GPU...")
+    print(f"Uploading {video_path.name} ({video_path.stat().st_size / 1e6:.1f} MB) to Modal GPU...")
     video_bytes = video_path.read_bytes()
 
     t_start = time.time()

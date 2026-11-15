@@ -2,55 +2,52 @@
 
 This directory contains the **Modal.com serverless GPU implementation** (`modal_app.py`).
 
-It allows you to run the complete computer vision pipeline (RF-DETR + Keypoint Homography + ByteTrack / SAM 2) on high-speed **NVIDIA A10G GPUs** in the cloud on-demand, with:
+It allows you to run the complete computer vision pipeline (RF-DETR + Court Homography + ByteTrack / SAM 2) on high-speed cloud GPUs on-demand with:
 - **Instant cold starts (~2–3 seconds)**.
-- **Pay-per-second billing** (billed only while processing; costs ~$0.005 per clip).
-- **Zero standby cost** ($0.00/month when idle).
+- **Pay-per-second billing** (billed only while actively processing; costs ~$0.0016 per clip on T4).
+- **Zero standby cost** ($0.00/month when idle, scales to 0).
 - **Public REST API endpoint** connected directly to the CourtView Live web application.
 
 ---
 
-## 🚀 Quick Setup (5 Minutes)
+## 🚀 Step-by-Step Setup Guide
 
-### 1. Create a Free Modal Account
-1. Go to [modal.com](https://modal.com) and sign up with GitHub.
-2. Modal provides **$30 in free credits every month**, which covers ~3,000 video analyses for free.
-
-### 2. Install Modal CLI
-In your local terminal:
+### Step 1: Install Modal CLI
+In your local command prompt or PowerShell:
 ```bash
 pip install modal
 ```
 
-Authenticate your local machine:
+### Step 2: Authenticate with Modal
+Run:
 ```bash
 modal setup
 ```
-*(This opens a browser window to link your local terminal to your Modal account).*
+This automatically opens your browser to authenticate and link your machine to your Modal account.
 
-### 3. Add your Roboflow API Key as a Modal Secret
-Never hardcode your API key. Create a secret named `roboflow-secret` in Modal:
+### Step 3: Add your Roboflow API Key as a Modal Secret
+Never hardcode your API key into code or Git. Store it securely in Modal:
 ```bash
 modal secret create roboflow-secret ROBOFLOW_API_KEY=your_roboflow_key_here
 ```
+*(Replace `your_roboflow_key_here` with your actual Roboflow API key from your Roboflow dashboard).*
 
 ---
 
-## 🧪 Testing Locally via Modal CLI
+## 🧪 Step 4: Test via Modal CLI (Optional but Recommended)
 
-You can test processing a video on a remote A10G GPU right from your terminal without deploying a persistent web server:
-
+You can test running the pipeline on a remote GPU right from your command line:
 ```bash
 modal run pipeline/modal_app.py --video web/public/clips/bos-nyk-q1-0428/video.mp4 --tracker bytetrack
 ```
 
 ### Expected Output:
 ```text
-Uploading video.mp4 (9.4 MB) to Modal A10G GPU...
+Uploading video.mp4 (9.4 MB) to Modal GPU...
 
 === Success! ===
-Total turnaround time: 14.8s
-GPU processing time:   8.2s (29.0 FPS)
+Total turnaround time: 13.4s
+GPU processing time:   7.8s (30.5 FPS)
 Frames analyzed:       238
 Tracker:               bytetrack
 Saved results to:      .../modal_output.json
@@ -58,29 +55,39 @@ Saved results to:      .../modal_output.json
 
 ---
 
-## 🌐 Deploying the Public API Endpoint for Web App Uploads
+## 🌐 Step 5: Deploy the Live Endpoint for Web App Uploads
 
-To enable users to upload `.mp4` videos directly from the deployed CourtView Live website:
+To enable the web application to send uploaded clips to your Modal GPU:
 
 ```bash
 modal deploy pipeline/modal_app.py
 ```
 
 ### Output:
-Modal will print your live public HTTPS endpoint:
+Modal will print your live HTTPS endpoint URL:
 ```text
 ✓ Created App: courtview-stream-tracker
-✓ Deployed analyze_video => https://your-username--courtview-stream-tracker-analyze-video.modal.run
+✓ Deployed api => https://<your-username>--courtview-stream-tracker-api.modal.run
 ```
-
-Copy that URL and paste it into the **Modal Endpoint URL** setting in the CourtView Live web application (or set `VITE_MODAL_API_URL` in `web/.env`).
 
 ---
 
-## 📊 Performance Comparison
+## 🏀 Step 6: Connect to CourtView Live
 
-| Infrastructure | Video Length | Processing Time | Cost |
-|---|---|---|---|
-| **Google Colab Free (T4 CPU/GPU)** | 3 videos (8s each) | ~30 – 35 mins | Free (Heavily throttled) |
-| **Modal A10G GPU (ByteTrack)** | 3 videos (8s each) | **~15 – 20 seconds total** | ~$0.01 (Covered by $30 free tier) |
-| **Modal A10G GPU (SAM 2 Large)** | 3 videos (8s each) | **~1.5 – 2 minutes total** | ~$0.03 (Covered by $30 free tier) |
+1. Open your web app (e.g. `http://localhost:5173` or your live Vercel URL).
+2. Click the blue **"Upload Clip"** button in the header.
+3. In the modal, paste your Modal URL into the **Modal.com Endpoint URL** field:
+   `https://<your-username>--courtview-stream-tracker-api.modal.run`
+   *(It saves automatically in your browser's local storage).*
+4. Drag and drop any 5–15 second `.mp4` clip and click **"Run GPU Analysis"**!
+5. In ~10–15 seconds, your clip will be fully tracked with 2K glowing floor rings, player badges, and 2D radar!
+
+---
+
+## 📊 Cost & Performance on Modal
+
+| Hardware | Video Length | Processing Time | Cost per Video | Videos per $1 Credit |
+|---|---|---|---|---|
+| **NVIDIA T4** *(Default)* | 8s (240 frames) | **~8 – 12 seconds** | **~$0.0016** | **~600 videos** |
+| **NVIDIA A10G** | 8s (240 frames) | **~6 – 8 seconds** | **~$0.0030** | **~330 videos** |
+| **Google Colab Free** | 8s (240 frames) | ~10 – 12 minutes | Free | Unlimited (Shared CPU) |
