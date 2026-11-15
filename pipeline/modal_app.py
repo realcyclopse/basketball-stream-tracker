@@ -37,9 +37,14 @@ APP_NAME = "courtview-stream-tracker"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("libgl1", "ffmpeg", "git")
+    .env({
+        "ONNXRUNTIME_EXECUTION_PROVIDERS": "[CUDAExecutionProvider]",
+    })
     .pip_install(
         "supervision>=0.25.0",
-        "inference-gpu>=0.25.0",
+        "inference>=0.25.0",
+        "onnxruntime-gpu",
+        "torch",
         "opencv-python>=4.10.0",
         "numpy>=1.26.0",
         "scipy>=1.13.0",
